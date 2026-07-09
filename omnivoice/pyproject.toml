@@ -1,0 +1,19 @@
+[project]
+name = "tts-omnivoice"
+version = "0.1.0"
+description = "k2-fsa/OmniVoice TTS CLI for vidgen (official PyTorch package, not the mlx-audio port)"
+requires-python = ">=3.11"
+dependencies = [
+    "omnivoice>=0.1.5",
+    "torch>=2.4",
+    "torchaudio>=2.4",
+    "soundfile>=0.12.1",
+    "numpy",
+    # Forced up — without this, uv's resolver picks numba==0.53.1 (via
+    # omnivoice -> librosa -> numba) which only supports Python <3.10 and
+    # fails to build its llvmlite dep on 3.11.
+    "numba>=0.59",
+]
+
+[tool.uv]
+package = false

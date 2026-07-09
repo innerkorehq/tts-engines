@@ -1,0 +1,24 @@
+[project]
+name = "tts-indic-xlit"
+version = "0.1.0"
+description = "IndicXlit transliteration CLI (indic<->roman, hinglish->devanagari) for vidgen"
+requires-python = ">=3.11"
+dependencies = [
+    "torch==2.6.0",
+    "torchaudio==2.6.0",
+    "numpy==1.26.4",
+    "transformers==5.2.0",
+    "huggingface-hub>=1.3.0,<2.0",
+    "tokenizers==0.22.2",
+    "protobuf==7.35.1",
+    "soundfile>=0.12.1",
+    "requests",
+    # fairseq==0.12.2 (installed --no-deps below) needs these but doesn't
+    # declare them resolvable on its own — pin to fairseq's required ranges
+    # so `uv sync` installs (and keeps) them as real, resolved deps.
+    "omegaconf<2.1",
+    "hydra-core<1.1,>=1.0.7",
+]
+
+[tool.uv]
+package = false

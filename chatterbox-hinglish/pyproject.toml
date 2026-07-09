@@ -1,0 +1,19 @@
+[project]
+name = "tts-chatterbox-hinglish"
+version = "0.1.0"
+description = "Chatterbox-Turbo-Hinglish voice-clone synthesis CLI for vidgen"
+requires-python = ">=3.11"
+dependencies = [
+    "chatterbox-tts>=0.1.7",
+    "transformers==5.2.0",
+    "torch>=2.2",
+    "torchaudio>=2.2",
+    "safetensors",
+    "soundfile>=0.12.1",
+    # resemble-perth (chatterbox-tts's watermarker) imports `pkg_resources`
+    # at import time, which is no longer vendored into venvs by default.
+    "setuptools",
+]
+
+[tool.uv]
+package = false

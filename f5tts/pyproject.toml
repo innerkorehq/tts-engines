@@ -1,0 +1,16 @@
+[project]
+name = "tts-f5tts"
+version = "0.1.0"
+description = "F5-TTS (SWivid/F5-TTS) synthesis daemon + fallback for vidgen"
+requires-python = ">=3.11"
+dependencies = [
+    "f5-tts>=1.1.0",
+    "huggingface-hub>=0.25",
+    "torch>=2.2",
+    "torchaudio>=2.2",
+    "soundfile>=0.12.1",
+    "cached-path>=1.6",
+]
+
+[tool.uv]
+package = false
