@@ -1,19 +1,23 @@
 #!/usr/bin/env python
 """
-IndicXlit transliteration CLI — shared by the kokoro and indicf5-hinglish
-engines.
+IndicXlit transliteration CLI — used by the kokoro engine (indic-to-roman)
+and the "hinglish-lid" text pipeline's Route B (roman-to-indic).
 
 Request (stdin JSON):
     {"mode": "indic-to-roman", "text": "..."}
         Convert Indic-script runs (Devanagari, Bengali, Gurmukhi, Gujarati,
         Odia, Tamil, Telugu, Kannada, Malayalam) to Roman-script
         approximations, leaving Latin text/digits/punctuation untouched.
+        Response: {"ok": true, "text": "..."}
 
-    {"mode": "hinglish-to-devanagari", "text": "..."}
-        Convert mixed-script Hinglish (Devanagari / Roman-Hindi / English) to
-        unified Devanagari.
+    {"mode": "roman-to-indic", "words": ["kal", "chalo"], "lang": "hi"}
+        Transliterate a batch of Roman-script words (assumed already
+        language-tagged as `lang` by an upstream word-LID step — this mode
+        does NOT itself decide which words are Hindi) to their native-script
+        spelling. Response: {"ok": true, "translations": {"kal": "कल", ...}}
+        — a word that fails to transliterate maps to itself unchanged.
 
-Response (stdout JSON): {"ok": true, "text": "..."}  or  {"ok": false, "error": "..."}
+Response (stdout JSON): {"ok": false, "error": "..."} on failure.
 """
 import logging
 import re
@@ -136,108 +140,48 @@ def transliterate_indic_to_roman(text: str) -> str:
     return "".join(out)
 
 
-# ── Hinglish → Devanagari (used by indicf5-hinglish) ────────────────────────
+# ── Roman → Indic (used by the "hinglish-lid" text pipeline's Route B) ─────
+#
+# Opposite direction from above: takes Roman-script words already tagged HI
+# by an upstream word-LID step (see tts-engines/text-pipeline/synth.py's
+# word-lid engine) and transliterates each into `lang`'s native script.
+# Kept as a separate engine cache (`_roman_to_indic_engines`) from
+# `_indic_to_roman_engines` above — XlitEngine instances are direction-
+# specific (src_script_type="roman" vs "indic"), not interchangeable.
 
-# Short Roman-script Hindi function words IndicXlit mis-transliterates as
-# English phonetics (e.g. "mai" → "माई" instead of "मैं"). Checked first.
-_HINGLISH_FUNCTION_WORDS: dict[str, str] = {
-    "aa":  "आ",    # "come" / leading vowel — IndicXlit gives "एए"
-    "hu":  "हूं",   # "am" (1st person) — IndicXlit gives "हू" (drops nasal)
-    "mai": "मैं",   # "I" — IndicXlit gives "माई" (English "my")
-    "tu":  "तू",    # "you" (informal) — IndicXlit gives "टू" (English "to")
-}
-
-# English loanwords common in Hinglish — stable canonical Devanagari forms.
-_HINGLISH_LOANWORDS: dict[str, str] = {
-    "biryani": "बिरयानी", "boss": "बॉस", "butter": "बटर", "cancel": "कैंसल",
-    "chicken": "चिकन", "close": "क्लोज़", "deadline": "डेडलाइन",
-    "deliver": "डिलीवर", "event": "इवेंट", "file": "फाइल",
-    "homework": "होमवर्क", "issue": "इश्यू", "laptop": "लैपटॉप",
-    "leave": "लीव", "log": "लॉग", "lucky": "लकी", "lunch": "लंच",
-    "message": "मैसेज", "movie": "मूवी", "nervous": "नर्वस", "new": "न्यू",
-    "office": "ऑफिस", "party": "पार्टी", "personal": "पर्सनल",
-    "place": "प्लेस", "please": "प्लीज़", "presentation": "प्रेज़ेंटेशन",
-    "quickly": "क्विकली", "reply": "रिप्लाई", "restaurant": "रेस्टोरेंट",
-    "review": "रिव्यू", "ticket": "टिकट", "tomorrow": "टुमॉरो",
-    "try": "ट्राई", "wait": "वेट", "waste": "वेस्ट",
-}
-
-# Indian named entities (cities, people, brands) — canonical Devanagari.
-# Apostrophes are split off before lookup, e.g. "Karim's" → "karim".
-_HINGLISH_NAMED_ENTITIES: dict[str, str] = {
-    "aishwarya": "ऐश्वर्या", "arjun": "अर्जुन", "bengaluru": "बेंगलुरु",
-    "chennai": "चेन्नई", "connaught": "कनॉट", "consultancy": "कंसल्टेंसी",
-    "delhi": "दिल्ली", "hyderabad": "हैदराबाद", "karim": "करीम",
-    "khanna": "खन्ना", "mr": "मिस्टर", "mumbai": "मुंबई", "old": "ओल्ड",
-    "paradise": "पैराडाइज़", "priya": "प्रिया", "pune": "पुणे",
-    "rohan": "रोहन", "services": "सर्विसेज़", "tata": "टाटा",
-}
-
-_HINGLISH_CANONICAL: dict[str, str] = {
-    **_HINGLISH_FUNCTION_WORDS,
-    **_HINGLISH_LOANWORDS,
-    **_HINGLISH_NAMED_ENTITIES,
-}
-
-# Captures: ASCII alpha runs | Devanagari runs | digit runs | whitespace runs
-# | any single char (punctuation/apostrophes). Apostrophes are NOT folded
-# into ASCII-alpha tokens, so "Karim's" → ["Karim", "'", "s"] and "karim"
-# hits the named-entity table.
-_HINGLISH_TOKEN_RE = re.compile(r"([A-Za-z]+|[ऀ-ॿ]+|\d+|\s+|.)", re.DOTALL)
-
-_hinglish_xlit_engine = None
+_roman_to_indic_engines: dict[str, object] = {}
 
 
-def _get_hinglish_xlit():
-    global _hinglish_xlit_engine
-    if _hinglish_xlit_engine is None:
-        _hinglish_xlit_engine = _load_xlit_engine("hi", "en")
-    return _hinglish_xlit_engine
+def transliterate_roman_to_indic(words: list[str], lang: str) -> dict[str, str]:
+    """
+    Transliterate each word in `words` from Roman script to `lang`'s native
+    script. Returns a dict mapping original -> transliterated word; a word
+    that fails to transliterate maps to itself unchanged. Caller (Route B in
+    text_pipelines.py) is responsible for only passing words a word-LID step
+    actually tagged as belonging to `lang` — this function does no language
+    detection of its own.
+    """
+    engine = _roman_to_indic_engines.get(lang)
+    if engine is None:
+        engine = _load_xlit_engine(lang, "roman")
+        _roman_to_indic_engines[lang] = engine
 
-
-def _is_devanagari_token(tok: str) -> bool:
-    has_deva = any("ऀ" <= c <= "ॿ" for c in tok)
-    has_ascii_alpha = any(c.isascii() and c.isalpha() for c in tok)
-    return has_deva and not has_ascii_alpha
-
-
-def _is_ascii_alpha_token(tok: str) -> bool:
-    return bool(tok) and all(c.isascii() and (c.isalpha() or c == "'") for c in tok)
-
-
-def _normalize_ascii_token(tok: str) -> str:
-    key = tok.lower()
-    canonical = _HINGLISH_CANONICAL.get(key)
-    if canonical is not None:
-        return canonical
-    xlit = _get_hinglish_xlit()
-    result = xlit.translit_word(key, topk=1)
-    if isinstance(result, dict):
-        cands = result.get("hi") or next(iter(result.values()), [])
-    elif isinstance(result, list):
-        cands = result
-    else:
-        cands = []
-    return cands[0] if cands else tok
-
-
-def hinglish_to_devanagari(text: str) -> str:
-    """Convert Hinglish text to unified Devanagari for IndicF5 input. Idempotent."""
-    if not text:
-        return text
-
-    out = []
-    for m in _HINGLISH_TOKEN_RE.finditer(text):
-        tok = m.group(0)
-        if tok.isspace():
-            out.append(tok)
-        elif _is_devanagari_token(tok):
-            out.append(tok)
-        elif _is_ascii_alpha_token(tok):
-            out.append(_normalize_ascii_token(tok))
+    out: dict[str, str] = {}
+    for word in dict.fromkeys(w for w in words if w and w.strip()):  # dedupe, preserve order
+        try:
+            result = engine.translit_word(word, lang, topk=1)
+        except Exception as e:
+            logger.warning("IndicXlit roman→indic failed for %r (lang=%s): %s", word, lang, e)
+            out[word] = word
+            continue
+        if isinstance(result, dict):
+            cands = next(iter(result.values()), [])
+        elif isinstance(result, list):
+            cands = result
         else:
-            out.append(tok)
-    return "".join(out)
+            cands = []
+        out[word] = cands[0] if cands else word
+    return out
 
 
 # ── Entry point ───────────────────────────────────────────────────────────
@@ -245,7 +189,6 @@ def hinglish_to_devanagari(text: str) -> str:
 def main() -> None:
     req = read_request()
     mode = req.get("mode")
-    text = req.get("text", "")
 
     # ai4bharat-transliteration / pydload print download-progress and status
     # messages directly to stdout via `print()`, which would corrupt our
@@ -255,12 +198,15 @@ def main() -> None:
     sys.stdout = sys.stderr
     try:
         if mode == "indic-to-roman":
-            result = transliterate_indic_to_roman(text)
-        elif mode == "hinglish-to-devanagari":
-            result = hinglish_to_devanagari(text)
+            text = req.get("text", "")
+            result_fields = {"text": transliterate_indic_to_roman(text)}
+        elif mode == "roman-to-indic":
+            words = req.get("words", [])
+            lang = req.get("lang", "hi")
+            result_fields = {"translations": transliterate_roman_to_indic(words, lang)}
         else:
             sys.stdout = real_stdout
-            fail(f"Unknown mode: {mode!r} (expected 'indic-to-roman' or 'hinglish-to-devanagari')")
+            fail(f"Unknown mode: {mode!r} (expected 'indic-to-roman' or 'roman-to-indic')")
             return
     except Exception as e:
         logger.exception("Transliteration failed")
@@ -270,7 +216,7 @@ def main() -> None:
     finally:
         sys.stdout = real_stdout
 
-    succeed(text=result)
+    succeed(**result_fields)
 
 
 if __name__ == "__main__":

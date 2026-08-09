@@ -22,14 +22,14 @@ Deliberately NOT consolidated here:
     with no error. Re-tested against the current mlx-audio release (0.4.4)
     and still reproduces. OmniVoice stays on the official k2-fsa PyTorch
     package (tts-engines/omnivoice/).
-  - chatterbox-hinglish, f5tts-hinglish, indicf5-hinglish, veena-hinglish:
-    fine-tuned Hinglish checkpoints on architectures mlx-audio either
-    doesn't implement at all (F5-TTS, IndicF5, Veena/SNAC) or where no
-    pre-converted MLX checkpoint exists for that specific fine-tune
-    (chatterbox-turbo-hinglish). Kept on their existing isolated engines.
+  - chatterbox-multilingual-hi, f5tts-hinglish: fine-tuned/Hindi-specialized
+    checkpoints on architectures mlx-audio either doesn't implement at all
+    (F5-TTS, IndicF5) or where no pre-converted MLX checkpoint exists for
+    that specific finetune (ResembleAI/Chatterbox-Multilingual-hi's T3
+    checkpoint). Kept on their existing isolated engines.
 
 Request (stdin JSON):
-    {"model": "qwen3-tts" | "chatterbox" | "voxtral-tts",
+    {"model": "qwen3-tts" | "chatterbox" | "voxtral-tts" | "svara-tts",
      "text": "...", "out": "/abs/out.wav", ...model-specific fields}
 
   qwen3-tts:   {"ref_audio": "/abs/ref.wav", "ref_text": "...",
@@ -47,6 +47,18 @@ Request (stdin JSON):
                 produced clean, correct Hindi speech. This is NOT a Hinglish
                 (code-switched) engine — that's still the dedicated
                 *-hinglish engines kept outside this consolidation.
+  svara-tts:   {"voice": "Hindi (Female)"}  (preset voices only, no cloning
+                — see _SVARA_TTS_VOICES; 38 presets = 19 languages x
+                Male/Female). kenpath/svara-tts-v1, an Orpheus/SNAC-family
+                model (Llama-3.2-3B backbone fine-tuned from Canopy's
+                Hindi Orpheus base + a SNAC 24kHz codec), 4-bit quantized
+                MLX port. Verified end-to-end: real Devanagari Hindi input
+                with voice="Hindi (Female)" produces clean, non-silent
+                24kHz audio. Feed native-script text per language (same
+                Devanagari-not-romanised caveat as voxtral-tts's hi_*
+                voices above — untested for the other 18 languages here,
+                but the underlying architecture is the same script-in
+                assumption).
 
 Response (stdout JSON): {"ok": true, "sample_rate": N, "duration_s": F}
                          or {"ok": false, "error": "..."}
@@ -64,6 +76,7 @@ _QWEN3_TTS_REPO = "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16"
 _CHATTERBOX_REPO = "mlx-community/chatterbox-turbo-fp16"
 _VOXTRAL_TTS_REPO = "mlx-community/Voxtral-4B-TTS-2603-mlx-bf16"
 _HIGGS_TTS_REPO = "bosonai/higgs-tts-3-4b"
+_SVARA_TTS_REPO = "mlx-community/svara-tts-v1-4bit"
 _higgs_tts_model = None
 
 _TARGET_SR = 24_000
@@ -71,6 +84,7 @@ _TARGET_SR = 24_000
 _qwen3_tts_model = None
 _chatterbox_model = None
 _voxtral_tts_model = None
+_svara_tts_model = None
 
 
 def _repo_looks_cached(repo: str) -> bool:
@@ -227,6 +241,48 @@ def _synthesise_voxtral_tts(text: str, out_path: str, voice: str) -> tuple[int, 
     return sample_rate, len(audio) / sample_rate
 
 
+# ── Svara-TTS (preset voices, no cloning — 19 Indian languages) ────────────
+
+_SVARA_TTS_LANGUAGES = [
+    "Hindi", "Bengali", "Marathi", "Telugu", "Kannada", "Tamil", "Malayalam",
+    "Gujarati", "Punjabi", "Assamese", "Bhojpuri", "Magahi", "Maithili",
+    "Chhattisgarhi", "Bodo", "Dogri", "Nepali", "Sanskrit", "English (Indian)",
+]
+_SVARA_TTS_VOICES = {
+    f"{lang} ({gender})" for lang in _SVARA_TTS_LANGUAGES for gender in ("Male", "Female")
+}
+
+
+def _get_svara_tts():
+    global _svara_tts_model
+    if _svara_tts_model is not None:
+        return _svara_tts_model
+    logger.info("Loading %s…", _SVARA_TTS_REPO)
+    _svara_tts_model = _load_model_local_first(_SVARA_TTS_REPO)
+    logger.info("Svara-TTS ready.")
+    return _svara_tts_model
+
+
+def _synthesise_svara_tts(text: str, out_path: str, voice: str) -> tuple[int, float]:
+    import numpy as np
+    import soundfile as sf
+
+    if voice not in _SVARA_TTS_VOICES:
+        raise ValueError(f"Unknown Svara-TTS voice {voice!r}; expected one of {sorted(_SVARA_TTS_VOICES)}")
+
+    model = _get_svara_tts()
+    results = list(model.generate(
+        text=text, voice=voice,
+        temperature=0.75, top_p=0.9, top_k=40, repetition_penalty=1.1, max_tokens=1200,
+    ))
+    if not results:
+        raise RuntimeError("Svara-TTS produced no audio")
+    audio = np.concatenate([np.array(r.audio) for r in results])
+    sample_rate = getattr(results[0], "sample_rate", None) or getattr(model, "sample_rate", _TARGET_SR)
+    sf.write(out_path, audio, sample_rate)
+    return sample_rate, len(audio) / sample_rate
+
+
 # ── Higgs-TTS (multilingual, single voice per language) ─────────────────────
 
 def _get_higgs_tts():
@@ -295,8 +351,10 @@ def main() -> None:
                     req.get("ref_audio", ""),
                     req.get("ref_text", ""),
                 )
+            elif model == "svara-tts":
+                sample_rate, duration_s = _synthesise_svara_tts(text, out_path, req.get("voice", "Hindi (Female)"))
             else:
-                fail(f"Unknown model: {model!r} (expected qwen3-tts/chatterbox/voxtral-tts/higgs-tts)")
+                fail(f"Unknown model: {model!r} (expected qwen3-tts/chatterbox/voxtral-tts/higgs-tts/svara-tts)")
                 return
     except Exception as e:
         logger.exception("mlx-audio synthesis failed (model=%s)", model)
