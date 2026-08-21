@@ -29,7 +29,8 @@ Deliberately NOT consolidated here:
     checkpoint). Kept on their existing isolated engines.
 
 Request (stdin JSON):
-    {"model": "qwen3-tts" | "chatterbox" | "voxtral-tts" | "svara-tts",
+    {"model": "qwen3-tts" | "chatterbox" | "chatterbox-multilingual" |
+              "voxtral-tts" | "svara-tts",
      "text": "...", "out": "/abs/out.wav", ...model-specific fields}
 
   qwen3-tts:   {"ref_audio": "/abs/ref.wav", "ref_text": "...",
@@ -39,6 +40,21 @@ Request (stdin JSON):
                 require a matching transcript. Reference clip MUST be
                 longer than 5 seconds — chatterbox-turbo hard-asserts on
                 this.)
+  chatterbox-multilingual:
+               {"ref_audio": "/abs/ref.wav", "language": "en"}
+               (mlx-community/chatterbox-multilingual-v3 — the base
+               Chatterbox T3 architecture, NOT chatterbox-turbo. Zero-shot
+               voice cloning, no ref_text needed, same as "chatterbox"
+               above. Genuinely multilingual: mlx-audio's chatterbox model
+               class (distinct from its chatterbox_turbo class, which
+               ignores lang_code entirely) supports a real `lang_code`
+               argument for 22 languages — ar/da/de/el/en/es/fi/fr/he/hi/
+               it/ja/ko/ms/nl/no/pl/pt/ru/sv/sw/tr/zh — passed straight
+               through here as `language`. Unlike chatterbox-turbo, this
+               model class has no verified minimum reference-clip-duration
+               assertion (checked directly against the installed package's
+               source — no such guard exists), so none is enforced here;
+               revisit if a real run surfaces one.
   voxtral-tts: {"voice": "hi_male"}  (preset voices only, no cloning —
                 see _VOXTRAL_VOICES). For hi_male/hi_female: feed genuine
                 Devanagari-script Hindi, NOT romanised Hinglish — tested
@@ -74,6 +90,7 @@ logger = logging.getLogger("mlx-audio")
 
 _QWEN3_TTS_REPO = "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16"
 _CHATTERBOX_REPO = "mlx-community/chatterbox-turbo-fp16"
+_CHATTERBOX_MULTILINGUAL_REPO = "mlx-community/chatterbox-multilingual-v3"
 _VOXTRAL_TTS_REPO = "mlx-community/Voxtral-4B-TTS-2603-mlx-bf16"
 _HIGGS_TTS_REPO = "bosonai/higgs-tts-3-4b"
 _SVARA_TTS_REPO = "mlx-community/svara-tts-v1-4bit"
@@ -83,8 +100,17 @@ _TARGET_SR = 24_000
 
 _qwen3_tts_model = None
 _chatterbox_model = None
+_chatterbox_multilingual_model = None
 _voxtral_tts_model = None
 _svara_tts_model = None
+
+# mlx-audio's chatterbox model class (see mlx_audio.tts.models.chatterbox,
+# distinct from chatterbox_turbo) — languages its `lang_code` param actually
+# supports, per its own generate() docstring/error message.
+_CHATTERBOX_MULTILINGUAL_LANGUAGES = {
+    "ar", "da", "de", "el", "en", "es", "fi", "fr", "he", "hi", "it", "ja",
+    "ko", "ms", "nl", "no", "pl", "pt", "ru", "sv", "sw", "tr", "zh",
+}
 
 
 def _repo_looks_cached(repo: str) -> bool:
@@ -191,6 +217,44 @@ def _synthesise_chatterbox(text: str, out_path: str, ref_audio: str) -> tuple[in
     results = list(model.generate(**kwargs))
     if not results:
         raise RuntimeError("Chatterbox produced no audio")
+    audio = np.concatenate([np.array(r.audio) for r in results])
+    sample_rate = getattr(results[0], "sample_rate", _TARGET_SR)
+    sf.write(out_path, audio, sample_rate)
+    return sample_rate, len(audio) / sample_rate
+
+
+# ── Chatterbox-Multilingual-v3 (zero-shot voice cloning, 22 languages) ─────
+
+def _get_chatterbox_multilingual():
+    global _chatterbox_multilingual_model
+    if _chatterbox_multilingual_model is not None:
+        return _chatterbox_multilingual_model
+    logger.info("Loading %s…", _CHATTERBOX_MULTILINGUAL_REPO)
+    _chatterbox_multilingual_model = _load_model_local_first(_CHATTERBOX_MULTILINGUAL_REPO)
+    logger.info("Chatterbox-Multilingual ready.")
+    return _chatterbox_multilingual_model
+
+
+def _synthesise_chatterbox_multilingual(
+    text: str, out_path: str, ref_audio: str, language: str,
+) -> tuple[int, float]:
+    import numpy as np
+    import soundfile as sf
+
+    lang_code = (language or "en").lower()
+    if lang_code not in _CHATTERBOX_MULTILINGUAL_LANGUAGES:
+        raise ValueError(
+            f"Unknown Chatterbox-Multilingual language {language!r}; "
+            f"expected one of {sorted(_CHATTERBOX_MULTILINGUAL_LANGUAGES)}"
+        )
+
+    model = _get_chatterbox_multilingual()
+    kwargs: dict = {"text": text, "lang_code": lang_code}
+    if ref_audio:
+        kwargs["ref_audio"] = ref_audio
+    results = list(model.generate(**kwargs))
+    if not results:
+        raise RuntimeError("Chatterbox-Multilingual produced no audio")
     audio = np.concatenate([np.array(r.audio) for r in results])
     sample_rate = getattr(results[0], "sample_rate", _TARGET_SR)
     sf.write(out_path, audio, sample_rate)
@@ -343,6 +407,10 @@ def main() -> None:
                 )
             elif model == "chatterbox":
                 sample_rate, duration_s = _synthesise_chatterbox(text, out_path, req.get("ref_audio", ""))
+            elif model == "chatterbox-multilingual":
+                sample_rate, duration_s = _synthesise_chatterbox_multilingual(
+                    text, out_path, req.get("ref_audio", ""), req.get("language", "en"),
+                )
             elif model == "voxtral-tts":
                 sample_rate, duration_s = _synthesise_voxtral_tts(text, out_path, req.get("voice", "neutral_female"))
             elif model == "higgs-tts":
@@ -354,7 +422,7 @@ def main() -> None:
             elif model == "svara-tts":
                 sample_rate, duration_s = _synthesise_svara_tts(text, out_path, req.get("voice", "Hindi (Female)"))
             else:
-                fail(f"Unknown model: {model!r} (expected qwen3-tts/chatterbox/voxtral-tts/higgs-tts/svara-tts)")
+                fail(f"Unknown model: {model!r} (expected qwen3-tts/chatterbox/chatterbox-multilingual/voxtral-tts/higgs-tts/svara-tts)")
                 return
     except Exception as e:
         logger.exception("mlx-audio synthesis failed (model=%s)", model)
