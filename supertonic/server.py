@@ -1,94 +1,64 @@
 #!/usr/bin/env python
 """
-Supertonic TTS persistent synthesis daemon.
+Supertonic TTS synthesis service.
 
-The original `synth.py` CLI is invoked as a *fresh* subprocess per scene —
-meaning the ONNX model gets reloaded from disk on every single narration
-clip. For a render with N scenes that's N full model loads instead of one.
+Loads the Supertonic ONNX model ONCE at startup and serves synthesis
+requests over a small HTTP API (FastAPI) for the lifetime of the process.
 
-This script instead loads the Supertonic ONNX model ONCE and then serves
-synthesis requests over a simple line-delimited JSON protocol on
-stdin/stdout, kept alive for the lifetime of the worker process. The caller
-(`TTSAdapter`) talks to it as a long-running daemon (spawning it lazily on
-first use and auto-restarting it if it crashes / falling back to the
-one-shot `synth.py` if it fails to start), instead of shelling out per call.
+Endpoints:
+    GET  /health       -> {"status": "ok"} once the model has finished loading.
+    POST /synthesize    Request body:
+                           {"text": "...", "voice": "M1", "lang": "en",
+                            "speed": 1.05, "steps": 8,
+                            "out": "/path/to/out.wav" (optional)}
+                         If "out" is given, the server writes the WAV file to
+                         that path and responds with JSON:
+                           {"ok": true, "sample_rate": 44100, "duration_s": F}
+                         If "out" is omitted, the response body IS the WAV
+                         audio (Content-Type: audio/wav), with sample_rate/
+                         duration_s in the X-Sample-Rate/X-Duration-Seconds
+                         response headers.
+                         On error: an HTTP error status with a JSON
+                         {"detail": "..."} body.
 
-Protocol (one JSON object per line, UTF-8, newline-terminated):
-    Request  -> {"text": "...", "out": "...", "voice": "M1", "lang": "en",
-                 "speed": 1.05, "steps": 8}
-    Response <- {"ok": true, "sample_rate": 44100, "duration_s": F}
-             <- {"ok": false, "error": "..."}
-A "READY" line is written to the protocol stream once the model has
-finished loading, so the parent process knows when it's safe to start
-sending requests. A "SHUTDOWN" line (exact string, not JSON) exits cleanly.
+Run: uv run server.py   (or: uvicorn server:app --host 0.0.0.0 --port 8009)
+Env vars: PORT (default 8009)
 """
-import json
+import io
+import logging
 import os
-import sys
-import traceback
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Optional
 
-# ── Protect the protocol stream from library noise ───────────────────────────
-# Supertonic's own pipeline code calls bare `print(...)` in a few spots (e.g.
-# per-chunk progress, "Generation complete!"), though only when `verbose=True`
-# is passed to `synthesize()` — which this daemon never does, matching
-# synth.py's behaviour. onnxruntime itself may also print provider/warning
-# noise during session creation. Since none of this is guaranteed to stay
-# silent across versions, apply the same defensive stdout-hijack as
-# f5tts_server.py regardless: duplicate the *original* stdout fd into a
-# dedicated file object reserved exclusively for protocol messages (READY /
-# JSON responses), then repoint `sys.stdout` at stderr so any incidental
-# `print()` from imported libraries is harmless diagnostic noise instead of
-# protocol corruption. This must happen BEFORE importing any ML libraries
-# (soundfile, supertonic/onnxruntime).
-_protocol_out = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
-sys.stdout = sys.stderr
+from fastapi import FastAPI, HTTPException, Response
+from pydantic import BaseModel
 
-
-def _send(line: str) -> None:
-    _protocol_out.write(line + "\n")
-    _protocol_out.flush()
-
-
-import soundfile as sf
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("supertonic")
 
 _SAMPLE_RATE = 44_100
-
-
-def _log(msg: str) -> None:
-    """Diagnostic logging to stderr — stdout is reserved for the protocol."""
-    print(f"[supertonic_server] {msg}", file=sys.stderr, flush=True)
+_DEFAULT_PORT = 8009
 
 
 def _load_model():
-    # One-time setup: import + construct the TTS engine (loads the ONNX
-    # session(s) from disk, downloading model files first if needed — same
-    # as `_get_tts()` in synth.py, just run unconditionally at startup
-    # instead of lazily on first request.
-    _log("Loading Supertonic TTS 3 (one-time, model download may occur)…")
+    # Loads the ONNX session(s) from disk, downloading model files first if
+    # needed.
+    logger.info("Loading Supertonic TTS 3 (one-time, model download may occur)…")
     from supertonic import TTS
     tts = TTS(auto_download=True)
-    _log("Supertonic TTS 3 ready.")
+    logger.info("Supertonic TTS 3 ready.")
     return tts
 
 
-def _handle_request(req: dict, tts) -> dict:
-    text = req.get("text", "")
-    out = req.get("out", "")
-    voice = req.get("voice") or "M1"
-    lang = req.get("lang") or "na"
-    speed = float(req.get("speed") or 1.05)
-    steps = int(req.get("steps") or 8)
+def _synthesise(tts, text: str, voice: str, lang: str, speed: float, steps: int):
+    """Returns a (sample_rate, mono float32 PCM ndarray) tuple.
 
-    if not text.strip():
-        return {"ok": False, "error": "text is required"}
-    if not out:
-        return {"ok": False, "error": "out path is required"}
-
-    # Per-request work: load the requested voice style and run inference.
-    # `get_voice_style` re-reads the style file per call (no shared mutable
-    # cache to worry about); `synthesize` only touches `tts.model`, the
-    # already-loaded ONNX session — safe to reuse across many calls, which
-    # is the whole point of loading it once.
+    `get_voice_style` re-reads the style file per call (no shared mutable
+    cache to worry about); `synthesize` only touches `tts.model`, the
+    already-loaded ONNX session — safe to reuse across many calls, which is
+    the whole point of loading it once.
+    """
     style = tts.get_voice_style(voice_name=voice)
     wav, duration = tts.synthesize(
         text=text,
@@ -99,37 +69,73 @@ def _handle_request(req: dict, tts) -> dict:
     )
     # wav: float32 numpy array (1, num_samples); trim to actual duration
     samples = wav[0, : int(_SAMPLE_RATE * duration[0].item())]
-    sf.write(out, samples, _SAMPLE_RATE)
-    duration_s = float(len(samples) / _SAMPLE_RATE)
-    _log(f"Synthesized {duration_s:.2f}s → {out}")
-
-    return {"ok": True, "sample_rate": _SAMPLE_RATE, "duration_s": duration_s}
+    return _SAMPLE_RATE, samples
 
 
-def main() -> int:
-    tts = _load_model()
+# ── FastAPI app ──────────────────────────────────────────────────────────────
 
-    # Signal readiness to the parent process on the protected protocol stream
-    # (NOT via `print`, which now points at stderr).
-    _send("READY")
+_state: dict = {}
 
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        if line == "SHUTDOWN":
-            _log("Received SHUTDOWN — exiting.")
-            return 0
-        try:
-            req = json.loads(line)
-            resp = _handle_request(req, tts)
-        except Exception as exc:  # noqa: BLE001 — must always answer the request
-            _log(f"Error handling request: {exc}\n{traceback.format_exc()}")
-            resp = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        _send(json.dumps(resp))
 
-    return 0
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _state["tts"] = _load_model()
+    yield
+
+
+app = FastAPI(title="supertonic", lifespan=lifespan)
+
+
+class SynthesizeRequest(BaseModel):
+    text: str
+    voice: str = "M1"
+    lang: str = "na"
+    speed: float = 1.05
+    steps: int = 8
+    out: Optional[str] = None
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok" if "tts" in _state else "loading"}
+
+
+@app.post("/synthesize")
+def synthesize(req: SynthesizeRequest):
+    import soundfile as sf
+
+    tts = _state.get("tts")
+    if tts is None:
+        raise HTTPException(status_code=503, detail="Model still loading — retry shortly.")
+    if not req.text.strip():
+        raise HTTPException(status_code=422, detail="text is required")
+
+    try:
+        sample_rate, audio = _synthesise(tts, req.text, req.voice, req.lang, req.speed, req.steps)
+    except Exception as exc:
+        logger.exception("Synthesis failed")
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+
+    duration_s = float(len(audio) / sample_rate)
+
+    if req.out:
+        Path(req.out).parent.mkdir(parents=True, exist_ok=True)
+        sf.write(req.out, audio, sample_rate)
+        return {"ok": True, "sample_rate": sample_rate, "duration_s": duration_s}
+
+    buf = io.BytesIO()
+    sf.write(buf, audio, sample_rate, format="WAV")
+    return Response(
+        content=buf.getvalue(),
+        media_type="audio/wav",
+        headers={
+            "X-Sample-Rate": str(sample_rate),
+            "X-Duration-Seconds": f"{duration_s:.3f}",
+        },
+    )
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", _DEFAULT_PORT)))

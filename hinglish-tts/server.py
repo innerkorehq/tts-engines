@@ -1,77 +1,50 @@
 #!/usr/bin/env python
 """
-hinglish-tts persistent synthesis daemon.
+hinglish-tts synthesis service.
 
-The original `synth.py` wrapper is invoked fresh (per scene) via vidgen's
-stdin/stdout JSON subprocess contract (see protocol.py) — meaning the
-IndicF5 model loaded by `inference.load_model()` gets reloaded from scratch
-on every single narration clip. For a render with N scenes that's N full
-model loads instead of one.
+Loads the IndicF5 model (via the vendored `inference.py`, upstream:
+harrrshall/hinglish-tts) ONCE at startup and serves synthesis requests over
+a small HTTP API (FastAPI) for the lifetime of the process.
 
-This script instead loads the model ONCE and then serves synthesis requests
-over a simple line-delimited JSON protocol on stdin/stdout, kept alive for
-the lifetime of the worker process. The caller (src/infra/adapters/tts.py)
-talks to it as a long-running daemon (spawning it lazily on first use and
-auto-restarting it if it crashes), instead of shelling out per call.
+No reimplementation — `inference.py` and `scoring/scripts/lib_normalize.py`
+are vendored verbatim from the upstream repo; this file only adapts them to
+a warm-service-serves-many structure.
 
-Protocol (one JSON object per line, UTF-8, newline-terminated):
-    Request  -> {"text": "...", "ref_audio": "...", "ref_text": "...", "out": "..."}
-    Response <- {"ok": true, "sample_rate": 24000, "duration_s": F}
-             <- {"ok": false, "error": "..."}
-A "READY" line is written to the protocol stream once the model has finished
-loading, so the parent process knows when it's safe to start sending
-requests. A "SHUTDOWN" line (exact string, not JSON) exits cleanly.
+Endpoints:
+    GET  /health       -> {"status": "ok"} once the model has finished loading.
+    POST /synthesize    Request body:
+                           {"text": "...", "ref_audio": "...", "ref_text": "...",
+                            "out": "/path/to/out.wav" (optional)}
+                         If "out" is given, the server writes the WAV file to
+                         that path and responds with JSON:
+                           {"ok": true, "sample_rate": 24000, "duration_s": F}
+                         If "out" is omitted, the response body IS the WAV
+                         audio (Content-Type: audio/wav).
+                         On error: an HTTP error status with a JSON
+                         {"detail": "..."} body.
 
-No reimplementation — inference.py and scoring/scripts/lib_normalize.py are
-vendored verbatim from the upstream repo (harrrshall/hinglish-tts); this
-file only adapts them to a warm-daemon-serves-many structure, same as
-tts-engines/f5tts/f5tts_server.py does for F5-TTS. synth.py stays as-is,
-used as a one-shot fallback by the caller if the daemon fails to start.
+Run: uv run server.py   (or: uvicorn server:app --host 0.0.0.0 --port 8005)
+Env vars: PORT (default 8005), HF_HOME, HF_TOKEN
 """
-import json
-import os
-import sys
-import traceback
-from pathlib import Path
-
-# ── Protect the protocol stream from library noise ───────────────────────────
-# inference.py (vendored upstream) calls bare `print(...)` during its
-# duration-patch diagnostics (see the "DEBUG-PATCH: ref_chars=..." print in
-# inference.py) and possibly elsewhere during model load / synthesis — all of
-# which would land on stdout and corrupt our line-delimited JSON protocol if
-# left alone. So: duplicate the *original* stdout fd into a dedicated file
-# object reserved exclusively for protocol messages (READY / JSON responses),
-# then repoint `sys.stdout` at stderr so every incidental `print()` from
-# imported libraries is harmless diagnostic noise instead of protocol
-# corruption. This must happen BEFORE importing any of the ML/vendored code.
-_protocol_out = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
-sys.stdout = sys.stderr
-
-
-def _send(line: str) -> None:
-    _protocol_out.write(line + "\n")
-    _protocol_out.flush()
-
-
+import io
 import logging
+import os
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Optional
 
-logging.basicConfig(level=logging.INFO, stream=sys.stderr)
-logger = logging.getLogger("hinglish-tts-server")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("hinglish-tts")
 
-
-def _log(msg: str) -> None:
-    """Diagnostic logging to stderr — stdout is reserved for the protocol."""
-    print(f"[hinglish-tts-server] {msg}", file=sys.stderr, flush=True)
+_DEFAULT_PORT = 8005
 
 
 def _apply_fairseq_compat_shims() -> None:
     """
     fairseq==0.12.2 (pulled in by ai4bharat-transliteration, used by the
     vendored scoring/scripts/lib_normalize.py) needs two scoped compat
-    shims on Python 3.11 / torch>=2.6 — same as tts-engines/indic-xlit/
-    synth.py's _load_xlit_engine, and identical to synth.py's own helper of
-    the same name. Applied here, once, before any inference — the vendored
-    upstream files themselves are left untouched.
+    shims on Python 3.11 / torch>=2.6. Applied here, once, before any
+    inference — the vendored upstream files themselves are left untouched.
     """
     import dataclasses as _dataclasses
     import torch as _torch
@@ -108,10 +81,7 @@ def _repo_looks_cached(repo_id: str) -> bool:
     huggingface_hub itself, since importing it (or anything that imports it,
     e.g. inference.py below, which loads ai4bharat/IndicF5 via plain
     transformers.AutoModel.from_pretrained with no local-cache check of its
-    own) before HF_HUB_OFFLINE is set makes the env var a no-op
-    (huggingface_hub reads it into a module-level constant at import time,
-    not dynamically per call). Same pattern as
-    chatterbox-multilingual-hi/server.py's identical helper.
+    own) before HF_HUB_OFFLINE is set makes the env var a no-op.
     """
     cache_dir = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser() / "hub"
     repo_dir = cache_dir / f"models--{repo_id.replace('/', '--')}"
@@ -123,69 +93,76 @@ _REPO = "ai4bharat/IndicF5"
 if _repo_looks_cached(_REPO):
     os.environ["HF_HUB_OFFLINE"] = "1"
 else:
-    _log(f"Not fully cached locally yet — downloading {_REPO}…")
+    logger.info("Not fully cached locally yet — downloading %s…", _REPO)
 
 from inference import load_model, synthesize  # noqa: E402 — must follow compat shims
+from fastapi import FastAPI, HTTPException, Response  # noqa: E402
+from pydantic import BaseModel  # noqa: E402
 
-# ── One-time model load, memoised at module scope ────────────────────────────
-# Mirrors synth.py's `_model` module-global cache — in the daemon this now
-# naturally persists across every request for the lifetime of the process,
-# since the whole interpreter stays alive instead of exiting after one call.
-_model = None
+_SAMPLE_RATE = 24_000
 
+# ── FastAPI app ──────────────────────────────────────────────────────────────
 
-def _get_model():
-    global _model
-    if _model is None:
-        _log("Loading IndicF5 via inference.load_model()…")
-        _model = load_model()
-        _log("IndicF5 ready.")
-    return _model
+_state: dict = {}
 
 
-def _handle_request(req: dict) -> dict:
-    text = req.get("text", "")
-    ref_audio = req["ref_audio"]
-    ref_text = req["ref_text"]
-    out = req["out"]
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Loading IndicF5 via inference.load_model()…")
+    _state["model"] = load_model()
+    logger.info("IndicF5 ready.")
+    yield
 
+
+app = FastAPI(title="hinglish-tts", lifespan=lifespan)
+
+
+class SynthesizeRequest(BaseModel):
+    text: str
+    ref_audio: str
+    ref_text: str
+    out: Optional[str] = None
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok" if "model" in _state else "loading"}
+
+
+@app.post("/synthesize")
+def synthesize_route(req: SynthesizeRequest):
     import soundfile as sf
 
-    model = _get_model()
-    audio = synthesize(model, text, ref_audio_path=ref_audio, ref_text=ref_text)
-    sample_rate = 24000
-    sf.write(out, audio, samplerate=sample_rate)
+    model = _state.get("model")
+    if model is None:
+        raise HTTPException(status_code=503, detail="Model still loading — retry shortly.")
 
-    return {"ok": True, "sample_rate": sample_rate, "duration_s": len(audio) / sample_rate}
+    try:
+        audio = synthesize(model, req.text, ref_audio_path=req.ref_audio, ref_text=req.ref_text)
+    except Exception as exc:
+        logger.exception("Synthesis failed")
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
 
+    duration_s = len(audio) / _SAMPLE_RATE
 
-def main() -> int:
-    # Warm the model once, before entering the request loop, so the READY
-    # signal genuinely means "ready to synthesize" (matches f5tts_server.py's
-    # behavior of loading before sending READY).
-    _get_model()
+    if req.out:
+        Path(req.out).parent.mkdir(parents=True, exist_ok=True)
+        sf.write(req.out, audio, samplerate=_SAMPLE_RATE)
+        return {"ok": True, "sample_rate": _SAMPLE_RATE, "duration_s": duration_s}
 
-    # Signal readiness to the parent process on the protected protocol stream
-    # (NOT via `print`, which now points at stderr).
-    _send("READY")
-
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        if line == "SHUTDOWN":
-            _log("Received SHUTDOWN — exiting.")
-            return 0
-        try:
-            req = json.loads(line)
-            resp = _handle_request(req)
-        except Exception as exc:  # noqa: BLE001 — must always answer the request
-            _log(f"Error handling request: {exc}\n{traceback.format_exc()}")
-            resp = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        _send(json.dumps(resp))
-
-    return 0
+    buf = io.BytesIO()
+    sf.write(buf, audio, samplerate=_SAMPLE_RATE, format="WAV")
+    return Response(
+        content=buf.getvalue(),
+        media_type="audio/wav",
+        headers={
+            "X-Sample-Rate": str(_SAMPLE_RATE),
+            "X-Duration-Seconds": f"{duration_s:.3f}",
+        },
+    )
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", _DEFAULT_PORT)))

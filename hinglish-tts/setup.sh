@@ -62,6 +62,8 @@ EOF
     echo "Patched urduhack/__init__.py to drop TensorFlow-pulling imports."
 fi
 
+.venv/bin/python -m pip install "fastapi>=0.115" "uvicorn[standard]>=0.30"
+
 echo "hinglish-tts venv ready: tts-engines/hinglish-tts/.venv"
 echo "Set HF_TOKEN in the environment (or .env) before first use — ai4bharat/IndicF5 is gated:"
 echo "  https://huggingface.co/ai4bharat/IndicF5"

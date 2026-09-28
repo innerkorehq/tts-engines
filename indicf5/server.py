@@ -1,64 +1,44 @@
 """
-IndicF5 (ai4bharat/IndicF5) persistent synthesis daemon.
+IndicF5 (ai4bharat/IndicF5) synthesis service.
 
-The original `synth.py` CLI is invoked as a *fresh* subprocess per scene —
-meaning the IndicF5 model (which bundles its own vocoder, loaded via
-`transformers.AutoModel(..., trust_remote_code=True)`) gets reloaded from
-scratch on every single narration clip. For a render with N scenes that's N
-full model loads instead of one.
+Loads the IndicF5 model (which bundles its own vocoder, loaded via
+`transformers.AutoModel(..., trust_remote_code=True)`) ONCE at startup and
+serves synthesis requests over a small HTTP API (FastAPI) for the lifetime
+of the process.
 
-This script instead loads the model ONCE and then serves synthesis requests
-over a simple line-delimited JSON protocol on stdin/stdout, kept alive for
-the lifetime of the worker process — mirroring
-`tts-engines/f5tts/f5tts_server.py`. The caller (`TTSAdapter`) talks to it as
-a long-running daemon (spawning it lazily on first use and auto-restarting
-it if it crashes), instead of shelling out to `synth.py` per call. `synth.py`
-itself is left untouched and still works as a one-shot fallback if the
-daemon can't be started.
+Endpoints:
+    GET  /health       -> {"status": "ok"} once the model has finished loading.
+    POST /synthesize    Request body:
+                           {"text": "...", "ref_audio": "...", "ref_text": "...",
+                            "out": "/path/to/out.wav" (optional)}
+                         If "out" is given, the server writes the WAV file to
+                         that path and responds with JSON:
+                           {"ok": true, "sample_rate": 24000, "duration_s": F}
+                         If "out" is omitted, the response body IS the WAV
+                         audio (Content-Type: audio/wav).
+                         On error: an HTTP error status with a JSON
+                         {"detail": "..."} body.
 
-Protocol (one JSON object per line, UTF-8, newline-terminated):
-    Request  -> {"text": "...", "ref_audio": "...", "ref_text": "...", "output_path": "..."}
-    Response <- {"ok": true, "sample_rate": 24000, "duration_s": F}
-             <- {"ok": false, "error": "..."}
-A "READY" line is written to the protocol stream once the model has
-finished loading, so the parent process knows when it's safe to start
-sending requests. A bare "SHUTDOWN" line exits the process cleanly.
+Run: uv run server.py   (or: uvicorn server:app --host 0.0.0.0 --port 8011)
+Env vars: PORT (default 8011), HF_TOKEN (ai4bharat/IndicF5 is gated)
 """
 import glob
+import io
+import logging
 import os
 import shutil
-import sys
+import tempfile
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Optional
 
-# ── Protect the protocol stream from library noise ───────────────────────────
-# IndicF5 (and the transformers/f5_tts machinery it pulls in via
-# trust_remote_code) print progress/status directly via bare `print(...)`
-# during model loading AND during inference — all of which would land on
-# stdout and corrupt our line-delimited JSON protocol if left alone. So:
-# duplicate the *original* stdout fd into a dedicated file object reserved
-# exclusively for protocol messages (READY / JSON responses), then repoint
-# `sys.stdout` at stderr so every incidental `print()` from imported
-# libraries is harmless diagnostic noise instead of protocol corruption.
-# This must happen BEFORE any ML-library imports below.
-_protocol_out = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
-sys.stdout = sys.stderr
+from fastapi import FastAPI, HTTPException, Response
+from pydantic import BaseModel
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("indicf5")
 
-def _send(line: str) -> None:
-    _protocol_out.write(line + "\n")
-    _protocol_out.flush()
-
-
-import json
-import logging
-import traceback
-
-logging.basicConfig(level=logging.INFO, stream=sys.stderr)
-logger = logging.getLogger("indicf5_server")
-
-
-def _log(msg: str) -> None:
-    """Diagnostic logging to stderr — stdout is reserved for the protocol."""
-    print(f"[indicf5_server] {msg}", file=sys.stderr, flush=True)
+_DEFAULT_PORT = 8011
 
 
 def _patch_indicf5_for_mps() -> None:
@@ -128,10 +108,10 @@ _DURATION_ORIG_BLOCK = (
 )
 _DURATION_PATCHED_BLOCK = (
     '            # PATCHED — character-count proportional duration (Mode A fix)\n'
-    '            ref_text_len = sum(1 for c in ref_text if not c.isspace())  # vidgen-patch\n'
+    '            ref_text_len = sum(1 for c in ref_text if not c.isspace())  # indicf5-patch\n'
     '            gen_text_len = sum(1 for c in gen_text if not c.isspace())\n'
 )
-_DURATION_SENTINEL = "vidgen-patch"
+_DURATION_SENTINEL = "indicf5-patch"
 
 
 def _patch_indicf5_duration_canvas() -> None:
@@ -160,12 +140,7 @@ def _patch_indicf5_duration_canvas() -> None:
 
 
 def _load_model():
-    """Load ai4bharat/IndicF5 via transformers.AutoModel(trust_remote_code=True).
-
-    One-time setup — runs once at daemon startup, before READY is signalled.
-    Identical to synth.py's load_model(), just renamed to avoid colliding
-    with any future module-level import of synth.py.
-    """
+    """Load ai4bharat/IndicF5 via transformers.AutoModel(trust_remote_code=True)."""
     import torch as _torch
     import transformers.modeling_utils as _mu
     from transformers import AutoModel
@@ -207,12 +182,6 @@ def _load_model():
     _PTM._finalize_model_loading = _finalize_model_loading_compat
     try:
         logger.info("Loading IndicF5 model from ai4bharat/IndicF5…")
-        # Unlike the one-shot synth.py (where every call is a brand-new
-        # subprocess, so local_files_only avoided a network round-trip on
-        # every synthesis call), the daemon only loads the model once for
-        # its entire lifetime — but we keep the same local_files_only-first
-        # strategy since it's still strictly faster/safer when the checkpoint
-        # is already cached, and falls back to a network-enabled load if not.
         try:
             model = AutoModel.from_pretrained(
                 "ai4bharat/IndicF5", trust_remote_code=True, low_cpu_mem_usage=False, local_files_only=True,
@@ -227,60 +196,80 @@ def _load_model():
     return model
 
 
-def _synthesise(model, text: str, ref_audio: str, ref_text: str, out: str) -> tuple:
-    """Per-request inference — identical body to synth.py's synthesise()."""
+def _synthesise(model, text: str, ref_audio: str, ref_text: str):
+    """Returns a (sample_rate, mono float32 PCM ndarray) tuple."""
     import numpy as np
-    import soundfile as sf
 
     audio = model(text, ref_audio_path=ref_audio, ref_text=ref_text)
     if hasattr(audio, "dtype") and audio.dtype == np.int16:
         audio = audio.astype(np.float32) / 32768.0
 
     audio = np.array(audio, dtype=np.float32)
-    sample_rate = 24000
-    sf.write(out, audio, samplerate=sample_rate)
-    return sample_rate, len(audio) / sample_rate
+    return 24000, audio
 
 
-def _handle_request(req: dict, model) -> dict:
-    text = req.get("text", "")
-    ref_audio = req["ref_audio"]
-    ref_text = req["ref_text"]
-    # Accept both the f5tts-daemon convention (`output_path`) and synth.py's
-    # own field name (`out`), so this daemon works with either caller shape.
-    output_path = req.get("output_path") or req["out"]
+# ── FastAPI app ──────────────────────────────────────────────────────────────
 
-    sample_rate, duration_s = _synthesise(model, text, ref_audio, ref_text, output_path)
-
-    return {"ok": True, "sample_rate": sample_rate, "duration_s": duration_s}
+_state: dict = {}
 
 
-def main() -> int:
-    _log("Loading IndicF5 model (one-time, this may take a while)…")
-    model = _load_model()
-    _log("Model ready.")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Loading IndicF5 model (one-time, this may take a while)…")
+    _state["model"] = _load_model()
+    logger.info("Model ready.")
+    yield
 
-    # Signal readiness to the parent process on the protected protocol stream
-    # (NOT via `print`, which now points at stderr).
-    _send("READY")
 
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        if line == "SHUTDOWN":
-            _log("Received SHUTDOWN — exiting.")
-            return 0
-        try:
-            req = json.loads(line)
-            resp = _handle_request(req, model)
-        except Exception as exc:  # noqa: BLE001 — must always answer the request
-            _log(f"Error handling request: {exc}\n{traceback.format_exc()}")
-            resp = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        _send(json.dumps(resp))
+app = FastAPI(title="indicf5", lifespan=lifespan)
 
-    return 0
+
+class SynthesizeRequest(BaseModel):
+    text: str
+    ref_audio: str
+    ref_text: str
+    out: Optional[str] = None
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok" if "model" in _state else "loading"}
+
+
+@app.post("/synthesize")
+def synthesize(req: SynthesizeRequest):
+    import soundfile as sf
+
+    model = _state.get("model")
+    if model is None:
+        raise HTTPException(status_code=503, detail="Model still loading — retry shortly.")
+
+    try:
+        sample_rate, audio = _synthesise(model, req.text, req.ref_audio, req.ref_text)
+    except Exception as exc:
+        logger.exception("Synthesis failed")
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+
+    duration_s = len(audio) / sample_rate
+
+    if req.out:
+        Path(req.out).parent.mkdir(parents=True, exist_ok=True)
+        sf.write(req.out, audio, samplerate=sample_rate)
+        return {"ok": True, "sample_rate": sample_rate, "duration_s": duration_s}
+
+    buf = io.BytesIO()
+    sf.write(buf, audio, samplerate=sample_rate, format="WAV")
+    return Response(
+        content=buf.getvalue(),
+        media_type="audio/wav",
+        headers={
+            "X-Sample-Rate": str(sample_rate),
+            "X-Duration-Seconds": f"{duration_s:.3f}",
+        },
+    )
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", _DEFAULT_PORT)))

@@ -1,7 +1,7 @@
 [project]
 name = "tts-indic-xlit"
 version = "0.1.0"
-description = "IndicXlit transliteration CLI (indic<->roman, hinglish->devanagari) for vidgen"
+description = "IndicXlit transliteration service (indic<->roman, hinglish->devanagari)"
 requires-python = ">=3.11"
 dependencies = [
     "torch==2.6.0",
@@ -18,6 +18,8 @@ dependencies = [
     # so `uv sync` installs (and keeps) them as real, resolved deps.
     "omegaconf<2.1",
     "hydra-core<1.1,>=1.0.7",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
 ]
 
 [tool.uv]

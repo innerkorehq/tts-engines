@@ -1,12 +1,14 @@
 [project]
 name = "tts-chatterbox-multilingual-hi"
 version = "0.2.0"
-description = "Chatterbox-Multilingual-hi (Hindi) voice-clone synthesis CLI for vidgen — MLX (Apple Silicon) via mlx-audio"
+description = "Chatterbox-Multilingual-hi (Hindi) voice-clone synthesis service — MLX (Apple Silicon) via mlx-audio"
 requires-python = ">=3.11"
 dependencies = [
     "mlx-audio[tts]>=0.4.4",
     "soundfile>=0.12.1",
     "numpy",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
 ]
 
 [tool.uv]

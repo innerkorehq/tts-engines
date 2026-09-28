@@ -1,85 +1,64 @@
 #!/usr/bin/env python
 """
-mlx-audio persistent synthesis daemon.
+mlx-audio synthesis service — 6 sub-model variants behind one process:
+qwen3-tts, chatterbox, chatterbox-multilingual, voxtral-tts, higgs-tts,
+svara-tts.
 
-`synth.py` in this directory handles 6 sub-model variants (qwen3-tts,
-chatterbox, chatterbox-multilingual, voxtral-tts, higgs-tts, svara-tts) but is
-invoked as a *fresh* subprocess per request — every synthesis call re-downloads
-nothing (thanks to HF_HUB_OFFLINE) but still re-loads that model's weights
-from disk onto the GPU/Neural Engine from scratch. For a render with many
-scenes using the same voice, that's one full model load per scene instead of
-one for the whole render.
+Models are loaded LAZILY (on first request for that model, since we don't
+know which of the 6 sub-models will be requested first) and kept resident
+for the process's lifetime.
 
-This script instead loads models LAZILY (on first request, since we don't
-know which of the 6 sub-models will be requested first) and then serves
-requests over the same line-delimited JSON protocol on stdin/stdout used by
-the other *_server.py daemons in this repo, kept alive for the worker
-process's lifetime.
-
-Single-model-resident design (deliberate, not an oversight): mlx-audio models
-here range from ~1-4GB+ each; keeping all 6 loaded simultaneously would multiply
-memory footprint for no benefit in the common case (a render typically uses
-one voice/model repeatedly). So this daemon keeps AT MOST ONE sub-model's
-weights resident at a time:
+Single-model-resident design (deliberate, not an oversight): mlx-audio
+models here range from ~1-4GB+ each; keeping all 6 loaded simultaneously
+would multiply memory footprint for no benefit in the common case (most
+deployments repeatedly use one voice/model). So this service keeps AT MOST
+ONE sub-model's weights resident at a time:
   - First request for model X: load X, remember it as current.
   - Next request, same model X: reuse the already-loaded object (warm path).
   - Next request, different model Y: drop the reference to X's model object,
-    run gc.collect() (mlx-audio/MLX exposes no explicit "unload" hook we could
-    find — this relies on Python GC + MLX's own lazy buffer reclamation), then
-    load Y fresh and make it current.
-This trades "switching voices mid-render costs a reload" for "6x lower peak
-memory" — acceptable since voice switches are rare relative to same-voice
-reuse within one render.
+    run gc.collect() (mlx-audio/MLX exposes no explicit "unload" hook we
+    could find — this relies on Python GC + MLX's own lazy buffer
+    reclamation), then load Y fresh and make it current.
+This trades "switching models costs a reload" for "6x lower peak memory" —
+acceptable since model switches are rare relative to same-model reuse.
 
-Protocol (one JSON object per line, UTF-8, newline-terminated):
-    Request  -> {"model": "qwen3-tts", "text": "...", "out": "/abs/out.wav", ...}
-    Response <- {"ok": true, "sample_rate": N, "duration_s": F}
-             <- {"ok": false, "error": "..."}
-A "READY" line is written to the protocol stream as soon as the process has
-finished importing — NOT after loading any model, since which of the 6
-sub-models will be requested first isn't known at startup. The first real
-model load happens lazily on the first request that needs it, same as
-synth.py's per-model `_get_*()` memoization, just kept across requests instead
-of re-run every process invocation.
-A "SHUTDOWN" line (bare string, not JSON) exits cleanly.
+Endpoints:
+    GET  /health       -> {"status": "ok"} (does not imply any model is loaded
+                          yet — models load lazily on first /synthesize call).
+    POST /synthesize    Request body:
+                           {"model": "qwen3-tts", "text": "...",
+                            "ref_audio": "...", "ref_text": "...",
+                            "language": "...", "voice": "...",
+                            "out": "/path/to/out.wav" (optional)}
+                         (which extra fields matter depends on "model" — see
+                         README.)
+                         If "out" is given, the server writes the WAV file to
+                         that path and responds with JSON:
+                           {"ok": true, "sample_rate": N, "duration_s": F}
+                         If "out" is omitted, the response body IS the WAV
+                         audio (Content-Type: audio/wav).
+                         On error: an HTTP error status with a JSON
+                         {"detail": "..."} body.
+
+Run: uv run server.py   (or: uvicorn server:app --host 0.0.0.0 --port 8007)
+Env vars: PORT (default 8007), HF_HOME, HF_TOKEN
 """
 import gc
-import json
+import io
 import logging
 import os
-import sys
-import traceback
 from pathlib import Path
+from typing import Optional
 
-# ── Protect the protocol stream from library noise ───────────────────────────
-# mlx-audio (and libraries it pulls in, e.g. huggingface_hub download
-# progress, mlx itself) commonly print progress/status directly via bare
-# `print(...)` during model loading AND during inference — this would corrupt
-# our line-delimited JSON protocol if left on stdout. So: duplicate the
-# *original* stdout fd into a dedicated file object reserved exclusively for
-# protocol messages (READY / JSON responses), then repoint `sys.stdout` at
-# stderr so incidental `print()` calls become harmless diagnostic noise
-# instead of protocol corruption. This must happen BEFORE importing anything
-# ML-related.
-_protocol_out = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
-sys.stdout = sys.stderr
+from fastapi import FastAPI, HTTPException, Response
+from pydantic import BaseModel
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("mlx-audio")
 
-def _send(line: str) -> None:
-    _protocol_out.write(line + "\n")
-    _protocol_out.flush()
+_DEFAULT_PORT = 8007
 
-
-logging.basicConfig(level=logging.INFO, stream=sys.stderr)
-logger = logging.getLogger("mlx-audio-server")
-
-
-def _log(msg: str) -> None:
-    """Diagnostic logging to stderr — stdout is reserved for the protocol."""
-    print(f"[mlx-audio-server] {msg}", file=sys.stderr, flush=True)
-
-
-# ── Model repo IDs (mirrors synth.py) ────────────────────────────────────────
+# ── Model repo IDs ────────────────────────────────────────────────────────
 _QWEN3_TTS_REPO = "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16"
 _CHATTERBOX_REPO = "mlx-community/chatterbox-turbo-fp16"
 _CHATTERBOX_MULTILINGUAL_REPO = "mlx-community/chatterbox-multilingual-v3"
@@ -120,7 +99,7 @@ _KNOWN_MODELS = {
 # ── Single-resident-model state ──────────────────────────────────────────────
 # At most one of these is non-None at any time — whichever model
 # `_current_model_name` names. Everything else is None.
-_current_model_name: str | None = None
+_current_model_name: Optional[str] = None
 _current_model_obj = None
 
 
@@ -159,20 +138,16 @@ def _unload_current_model() -> None:
     framework itself expose an explicit "unload"/"free" call as far as this
     code found — MLX arrays are lazily-evaluated and reference-counted, so
     dropping the last Python reference plus a `gc.collect()` is the
-    documented way to let their backing memory be released. If a future
-    mlx-audio/mlx version adds an explicit release hook, prefer that here.
+    documented way to let their backing memory be released.
     """
     global _current_model_obj, _current_model_name
     if _current_model_obj is not None:
-        _log(f"Unloading current model ({_current_model_name}) before switching…")
+        logger.info("Unloading current model (%s) before switching…", _current_model_name)
     _current_model_obj = None
     _current_model_name = None
     gc.collect()
     try:
         import mlx.core as mx
-        # Best-effort: release cached (but unreferenced) buffers in MLX's
-        # memory pool back to the system allocator. Safe no-op if the
-        # installed mlx version lacks this call.
         if hasattr(mx, "clear_cache"):
             mx.clear_cache()
     except Exception:
@@ -201,31 +176,28 @@ def _ensure_model_loaded(model_name: str):
         "svara-tts": _SVARA_TTS_REPO,
     }[model_name]
 
-    _log(f"Loading {model_name} ({repo})…")
+    logger.info("Loading %s (%s)…", model_name, repo)
     model_obj = _load_model_local_first(repo)
-    _log(f"{model_name} ready.")
+    logger.info("%s ready.", model_name)
 
     _current_model_obj = model_obj
     _current_model_name = model_name
     return model_obj
 
 
-# ── Per-model inference (mirrors synth.py's _synthesise_* functions) ────────
+# ── Per-model inference ──────────────────────────────────────────────────────
 
-def _synthesise_qwen3_tts(model, text: str, out_path: str, ref_audio: str, ref_text: str, language: str):
+def _synthesise_qwen3_tts(model, text: str, ref_audio: str, ref_text: str, language: str):
     import numpy as np
-    import soundfile as sf
 
     results = list(model.generate(text=text, ref_audio=ref_audio, ref_text=ref_text, language=language or "English"))
     if not results:
         raise RuntimeError("Qwen3-TTS produced no audio")
     audio = np.concatenate([np.array(r.audio) for r in results])
-    sample_rate = getattr(results[0], "sample_rate", _TARGET_SR)
-    sf.write(out_path, audio, sample_rate)
-    return sample_rate, len(audio) / sample_rate
+    return getattr(results[0], "sample_rate", _TARGET_SR), audio
 
 
-def _synthesise_chatterbox(model, text: str, out_path: str, ref_audio: str):
+def _synthesise_chatterbox(model, text: str, ref_audio: str):
     import numpy as np
     import soundfile as sf
 
@@ -244,14 +216,11 @@ def _synthesise_chatterbox(model, text: str, out_path: str, ref_audio: str):
     if not results:
         raise RuntimeError("Chatterbox produced no audio")
     audio = np.concatenate([np.array(r.audio) for r in results])
-    sample_rate = getattr(results[0], "sample_rate", _TARGET_SR)
-    sf.write(out_path, audio, sample_rate)
-    return sample_rate, len(audio) / sample_rate
+    return getattr(results[0], "sample_rate", _TARGET_SR), audio
 
 
-def _synthesise_chatterbox_multilingual(model, text: str, out_path: str, ref_audio: str, language: str):
+def _synthesise_chatterbox_multilingual(model, text: str, ref_audio: str, language: str):
     import numpy as np
-    import soundfile as sf
 
     lang_code = (language or "en").lower()
     if lang_code not in _CHATTERBOX_MULTILINGUAL_LANGUAGES:
@@ -267,14 +236,11 @@ def _synthesise_chatterbox_multilingual(model, text: str, out_path: str, ref_aud
     if not results:
         raise RuntimeError("Chatterbox-Multilingual produced no audio")
     audio = np.concatenate([np.array(r.audio) for r in results])
-    sample_rate = getattr(results[0], "sample_rate", _TARGET_SR)
-    sf.write(out_path, audio, sample_rate)
-    return sample_rate, len(audio) / sample_rate
+    return getattr(results[0], "sample_rate", _TARGET_SR), audio
 
 
-def _synthesise_voxtral_tts(model, text: str, out_path: str, voice: str):
+def _synthesise_voxtral_tts(model, text: str, voice: str):
     import numpy as np
-    import soundfile as sf
 
     if voice not in _VOXTRAL_VOICES:
         raise ValueError(f"Unknown Voxtral-TTS voice {voice!r}; expected one of {sorted(_VOXTRAL_VOICES)}")
@@ -290,14 +256,11 @@ def _synthesise_voxtral_tts(model, text: str, out_path: str, voice: str):
     if not results:
         raise RuntimeError("Voxtral-TTS produced no audio")
     audio = np.concatenate([np.array(r.audio) for r in results])
-    sample_rate = getattr(results[0], "sample_rate", _TARGET_SR)
-    sf.write(out_path, audio, sample_rate)
-    return sample_rate, len(audio) / sample_rate
+    return getattr(results[0], "sample_rate", _TARGET_SR), audio
 
 
-def _synthesise_svara_tts(model, text: str, out_path: str, voice: str):
+def _synthesise_svara_tts(model, text: str, voice: str):
     import numpy as np
-    import soundfile as sf
 
     if voice not in _SVARA_TTS_VOICES:
         raise ValueError(f"Unknown Svara-TTS voice {voice!r}; expected one of {sorted(_SVARA_TTS_VOICES)}")
@@ -310,13 +273,11 @@ def _synthesise_svara_tts(model, text: str, out_path: str, voice: str):
         raise RuntimeError("Svara-TTS produced no audio")
     audio = np.concatenate([np.array(r.audio) for r in results])
     sample_rate = getattr(results[0], "sample_rate", None) or getattr(model, "sample_rate", _TARGET_SR)
-    sf.write(out_path, audio, sample_rate)
-    return sample_rate, len(audio) / sample_rate
+    return sample_rate, audio
 
 
-def _synthesise_higgs_tts(model, text: str, out_path: str, ref_audio: str, ref_text: str):
+def _synthesise_higgs_tts(model, text: str, ref_audio: str, ref_text: str):
     import numpy as np
-    import soundfile as sf
 
     # lang_code is not passed — higgs_audio_v3.generate() deletes **kwargs and
     # auto-detects language from the text content.
@@ -329,77 +290,99 @@ def _synthesise_higgs_tts(model, text: str, out_path: str, ref_audio: str, ref_t
     if not results:
         raise RuntimeError("Higgs-TTS produced no audio")
     audio = np.concatenate([np.array(r.audio) for r in results])
-    sample_rate = getattr(results[0], "sample_rate", _TARGET_SR)
-    sf.write(out_path, audio, sample_rate)
-    return sample_rate, float(len(audio) / sample_rate)
+    return getattr(results[0], "sample_rate", _TARGET_SR), audio
 
 
-def _handle_request(req: dict) -> dict:
-    model_name = req.get("model")
-    text = req.get("text", "")
-    out_path = req.get("out")
-
-    if model_name not in _KNOWN_MODELS:
-        raise ValueError(
-            f"Unknown model: {model_name!r} (expected one of {sorted(_KNOWN_MODELS)})"
-        )
-    if not text.strip():
-        raise ValueError("text is empty")
-    if not out_path:
-        raise ValueError("out path is required")
-
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-
+def _synthesise(model_name: str, text: str, req: "SynthesizeRequest"):
+    """Returns a (sample_rate, mono float32 PCM ndarray) tuple."""
     model = _ensure_model_loaded(model_name)
 
     if model_name == "qwen3-tts":
-        sample_rate, duration_s = _synthesise_qwen3_tts(
-            model, text, out_path, req.get("ref_audio", ""), req.get("ref_text", ""), req.get("language", "English"),
-        )
+        return _synthesise_qwen3_tts(model, text, req.ref_audio or "", req.ref_text or "", req.language or "English")
     elif model_name == "chatterbox":
-        sample_rate, duration_s = _synthesise_chatterbox(model, text, out_path, req.get("ref_audio", ""))
+        return _synthesise_chatterbox(model, text, req.ref_audio or "")
     elif model_name == "chatterbox-multilingual":
-        sample_rate, duration_s = _synthesise_chatterbox_multilingual(
-            model, text, out_path, req.get("ref_audio", ""), req.get("language", "en"),
-        )
+        return _synthesise_chatterbox_multilingual(model, text, req.ref_audio or "", req.language or "en")
     elif model_name == "voxtral-tts":
-        sample_rate, duration_s = _synthesise_voxtral_tts(model, text, out_path, req.get("voice", "neutral_female"))
+        return _synthesise_voxtral_tts(model, text, req.voice or "neutral_female")
     elif model_name == "higgs-tts":
-        sample_rate, duration_s = _synthesise_higgs_tts(
-            model, text, out_path, req.get("ref_audio", ""), req.get("ref_text", ""),
-        )
+        return _synthesise_higgs_tts(model, text, req.ref_audio or "", req.ref_text or "")
     elif model_name == "svara-tts":
-        sample_rate, duration_s = _synthesise_svara_tts(model, text, out_path, req.get("voice", "Hindi (Female)"))
-    else:  # unreachable — guarded by _KNOWN_MODELS check above
+        return _synthesise_svara_tts(model, text, req.voice or "Hindi (Female)")
+    else:  # unreachable — guarded by _KNOWN_MODELS check in the route
         raise AssertionError(f"unhandled model {model_name!r}")
 
-    return {"ok": True, "sample_rate": sample_rate, "duration_s": duration_s}
+
+# ── FastAPI app ──────────────────────────────────────────────────────────────
+
+app = FastAPI(title="mlx-audio")
 
 
-def main() -> int:
-    # No model is loaded yet — which of the 6 sub-models is needed isn't
-    # known until the first request arrives, so signal readiness as soon as
-    # imports/setup are done rather than blocking on a model load.
-    _send("READY")
-    _log("Ready — no model loaded yet, will load lazily on first request.")
+class SynthesizeRequest(BaseModel):
+    model: str
+    text: str
+    ref_audio: Optional[str] = None
+    ref_text: Optional[str] = None
+    language: Optional[str] = None
+    voice: Optional[str] = None
+    out: Optional[str] = None
 
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        if line == "SHUTDOWN":
-            _log("Received SHUTDOWN — exiting.")
-            return 0
-        try:
-            req = json.loads(line)
-            resp = _handle_request(req)
-        except Exception as exc:  # noqa: BLE001 — must always answer the request
-            _log(f"Error handling request: {exc}\n{traceback.format_exc()}")
-            resp = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        _send(json.dumps(resp))
 
-    return 0
+@app.get("/health")
+def health():
+    # Does not imply any model is loaded yet — models load lazily on first
+    # /synthesize call for that model (see module docstring).
+    return {"status": "ok", "resident_model": _current_model_name}
+
+
+@app.post("/synthesize")
+async def synthesize(req: SynthesizeRequest):
+    # async def, not plain def: MLX's GPU stream/command queue is
+    # thread-local, and FastAPI runs plain `def` route handlers in a worker
+    # thread pool — calling into an MLX model from a different thread than
+    # it was loaded on fails with "RuntimeError: There is no Stream(gpu, 0)
+    # in current thread." An `async def` handler stays on the event-loop
+    # thread instead, matching where models get loaded on first use.
+    import soundfile as sf
+
+    if req.model not in _KNOWN_MODELS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown model: {req.model!r} (expected one of {sorted(_KNOWN_MODELS)})",
+        )
+    if not req.text.strip():
+        raise HTTPException(status_code=422, detail="text is empty")
+
+    try:
+        sample_rate, audio = _synthesise(req.model, req.text, req)
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Synthesis failed")
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+
+    duration_s = len(audio) / sample_rate
+
+    if req.out:
+        Path(req.out).parent.mkdir(parents=True, exist_ok=True)
+        sf.write(req.out, audio, sample_rate)
+        return {"ok": True, "sample_rate": sample_rate, "duration_s": duration_s}
+
+    buf = io.BytesIO()
+    sf.write(buf, audio, sample_rate, format="WAV")
+    return Response(
+        content=buf.getvalue(),
+        media_type="audio/wav",
+        headers={
+            "X-Sample-Rate": str(sample_rate),
+            "X-Duration-Seconds": f"{duration_s:.3f}",
+        },
+    )
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", _DEFAULT_PORT)))

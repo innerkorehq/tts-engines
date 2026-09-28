@@ -1,32 +1,32 @@
 """
-F5-TTS-Hinglish persistent synthesis daemon.
+F5-TTS-Hinglish synthesis service.
 
-`synth.py` in this directory is invoked fresh for every narration clip —
-meaning the F5-TTS-Small DiT checkpoint (fine-tuned for Hindi-English
-code-switched narration, `rajputsw/F5-TTS-Hinglish`) gets downloaded/loaded
-from scratch on every single call. For a render with N scenes that's N full
-model loads instead of one.
+Loads the `rajputsw/F5-TTS-Hinglish` DiT checkpoint (fine-tuned for
+Hindi-English code-switched narration) ONCE at startup and serves synthesis
+requests over a small HTTP API (FastAPI) for the lifetime of the process.
 
-This script instead loads the model ONCE and then serves synthesis requests
-over a simple line-delimited JSON protocol on stdin/stdout, kept alive for the
-lifetime of the worker process — mirroring the pattern used by the sibling
-`tts-engines/f5tts/f5tts_server.py` daemon for the stock F5-TTS engine.
-
-Protocol (one JSON object per line, UTF-8, newline-terminated) — same request/
-response shape as the one-shot `synth.py` CLI (see `protocol.read_request` /
-`protocol.succeed` / `protocol.fail`):
-    Request  -> {"text": "...", "ref_audio": "...", "ref_text": "...", "out": "..."}
-    Response <- {"ok": true, "sample_rate": 24000, "duration_s": 3.21}
-             <- {"ok": false, "error": "..."}
-A "READY" line is written to the protocol stdout stream once the model has
-finished loading, so the parent process knows when it's safe to start sending
-requests. A "SHUTDOWN" line (bare string, not JSON) exits cleanly.
+Endpoints:
+    GET  /health       -> {"status": "ok"} once the model has finished loading.
+    POST /synthesize    Request body:
+                           {"text": "...", "ref_audio": "...", "ref_text": "...",
+                            "out": "/path/to/out.wav" (optional)}
+                         If "out" is given, the server writes the WAV file to
+                         that path and responds with JSON:
+                           {"ok": true, "sample_rate": 24000, "duration_s": F}
+                         If "out" is omitted, the response body IS the WAV
+                         audio (Content-Type: audio/wav), with sample_rate/
+                         duration_s in the X-Sample-Rate/X-Duration-Seconds
+                         response headers.
+                         On error: an HTTP error status with a JSON
+                         {"detail": "..."} body.
 
 Why the ThreadPoolExecutor patch: F5-TTS's own `infer_process`/
-`infer_batch_process` (used internally by `f5_tts.api.F5TTS.infer`) spins up a
-`ThreadPoolExecutor` that isn't safe for concurrent `model_obj.sample()` calls
-on Apple Silicon MPS — patched to max_workers=1 below, same as the stock
-f5tts_server.py daemon, and for the same reason.
+`infer_batch_process` (used internally by `f5_tts.api.F5TTS.infer`) spins up
+a `ThreadPoolExecutor` that isn't safe for concurrent `model_obj.sample()`
+calls on Apple Silicon MPS — patched to max_workers=1 below.
+
+Run: uv run server.py   (or: uvicorn server:app --host 0.0.0.0 --port 8004)
+Env vars: PORT (default 8004), HF_HOME, HF_TOKEN
 """
 import concurrent.futures as _cf
 
@@ -44,42 +44,22 @@ class _SequentialTPE(_OrigTPE):
 
 _cf.ThreadPoolExecutor = _SequentialTPE  # patch before f5_tts imports
 
-import json
-import os
-import sys
-import traceback
-from pathlib import Path
-
-# ── Protect the protocol stream from library noise ───────────────────────────
-# F5-TTS's own code (and huggingface_hub's download progress) calls bare
-# `print(...)` during model loading AND during inference — all of which would
-# land on stdout and corrupt our line-delimited JSON protocol if left alone.
-# So: duplicate the *original* stdout fd into a dedicated file object reserved
-# exclusively for protocol messages (READY / JSON responses), then repoint
-# `sys.stdout` at stderr so every incidental `print()` from imported libraries
-# is harmless diagnostic noise instead of protocol corruption. This must
-# happen BEFORE importing huggingface_hub/f5_tts/soundfile.
-_protocol_out = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
-sys.stdout = sys.stderr
-
-
-def _send(line: str) -> None:
-    _protocol_out.write(line + "\n")
-    _protocol_out.flush()
-
-
+import io
 import logging
+import os
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Optional
 
-logging.basicConfig(level=logging.INFO, stream=sys.stderr)
-logger = logging.getLogger("f5tts-hinglish-server")
+from fastapi import FastAPI, HTTPException, Response
+from pydantic import BaseModel
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("f5tts-hinglish")
 
 _HF_REPO = "rajputsw/F5-TTS-Hinglish"
 _MODEL_CONFIG = "F5TTS_Small"  # 768-dim/18-layer/12-head DiT, matches this checkpoint
-
-
-def _log(msg: str) -> None:
-    """Diagnostic logging to stderr — stdout is reserved for the protocol."""
-    print(f"[f5tts-hinglish-server] {msg}", file=sys.stderr, flush=True)
+_DEFAULT_PORT = 8004
 
 
 def _repo_looks_cached(repo_id: str) -> bool:
@@ -87,9 +67,8 @@ def _repo_looks_cached(repo_id: str) -> bool:
     Cheap heuristic: does this repo have at least one snapshot directory in
     the local HF cache? Checked via plain filesystem access — NOT via
     huggingface_hub itself, since importing it before HF_HUB_OFFLINE is set
-    makes the env var a no-op (huggingface_hub reads it into a
-    module-level constant at import time, not dynamically per call). Same
-    pattern as chatterbox-multilingual-hi/server.py's identical helper.
+    makes the env var a no-op (huggingface_hub reads it into a module-level
+    constant at import time, not dynamically per call).
     """
     cache_dir = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser() / "hub"
     repo_dir = cache_dir / f"models--{repo_id.replace('/', '--')}"
@@ -98,16 +77,10 @@ def _repo_looks_cached(repo_id: str) -> bool:
 
 
 def _load_model():
-    """One-time setup: download checkpoint/vocab and load the F5TTS model.
-
-    Runs once at daemon startup, before the READY signal. Mirrors exactly
-    what synth.py did per-call, just hoisted out of the per-request path.
-    """
     # hf_hub_download() hits huggingface.co's API unconditionally (no local
     # cache check of its own) unless HF_HUB_OFFLINE is set — force it once
     # this repo is confirmed cached, so a transient HF Hub connectivity blip
-    # can't crash startup for a checkpoint that's already on disk (confirmed
-    # in production for the sibling local-chat-mlx daemon).
+    # can't crash startup for a checkpoint that's already on disk.
     if _repo_looks_cached(_HF_REPO):
         os.environ["HF_HUB_OFFLINE"] = "1"
     else:
@@ -126,12 +99,8 @@ def _load_model():
     return tts
 
 
-def _handle_request(req: dict, tts) -> dict:
-    text = req.get("text", "")
-    ref_audio = req["ref_audio"]
-    ref_text = req["ref_text"]
-    out = req["out"]
-
+def _synthesise(tts, text: str, ref_audio: str, ref_text: str):
+    """Returns a (sample_rate, mono float32 PCM ndarray) tuple."""
     wav, sample_rate, _spec = tts.infer(
         ref_file=ref_audio,
         ref_text=ref_text,
@@ -145,37 +114,73 @@ def _handle_request(req: dict, tts) -> dict:
         # in-range seed explicitly to avoid that.
         seed=0,
     )
+    return sample_rate, wav
 
+
+# ── FastAPI app ──────────────────────────────────────────────────────────────
+
+_state: dict = {}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _state["tts"] = _load_model()
+    yield
+
+
+app = FastAPI(title="f5tts-hinglish", lifespan=lifespan)
+
+
+class SynthesizeRequest(BaseModel):
+    text: str
+    ref_audio: str
+    ref_text: str
+    out: Optional[str] = None
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok" if "tts" in _state else "loading"}
+
+
+@app.post("/synthesize")
+async def synthesize(req: SynthesizeRequest):
+    # async def, not plain def — keeps model calls on the event-loop thread
+    # rather than FastAPI's worker thread pool (this backend's internal
+    # ThreadPoolExecutor patch above already assumes sequential, single-
+    # thread-at-a-time execution).
     import soundfile as sf
-    sf.write(out, wav, sample_rate)
 
-    return {"ok": True, "sample_rate": sample_rate, "duration_s": len(wav) / sample_rate}
+    tts = _state.get("tts")
+    if tts is None:
+        raise HTTPException(status_code=503, detail="Model still loading — retry shortly.")
 
+    try:
+        sample_rate, audio = _synthesise(tts, req.text, req.ref_audio, req.ref_text)
+    except Exception as exc:
+        logger.exception("Synthesis failed")
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
 
-def main() -> int:
-    tts = _load_model()
+    duration_s = len(audio) / sample_rate
 
-    # Signal readiness to the parent process on the protected protocol stream
-    # (NOT via `print`, which now points at stderr).
-    _send("READY")
+    if req.out:
+        Path(req.out).parent.mkdir(parents=True, exist_ok=True)
+        sf.write(req.out, audio, sample_rate)
+        return {"ok": True, "sample_rate": sample_rate, "duration_s": duration_s}
 
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        if line == "SHUTDOWN":
-            _log("Received SHUTDOWN — exiting.")
-            return 0
-        try:
-            req = json.loads(line)
-            resp = _handle_request(req, tts)
-        except Exception as exc:  # noqa: BLE001 — must always answer the request
-            _log(f"Error handling request: {exc}\n{traceback.format_exc()}")
-            resp = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        _send(json.dumps(resp))
-
-    return 0
+    buf = io.BytesIO()
+    sf.write(buf, audio, sample_rate, format="WAV")
+    return Response(
+        content=buf.getvalue(),
+        media_type="audio/wav",
+        headers={
+            "X-Sample-Rate": str(sample_rate),
+            "X-Duration-Seconds": f"{duration_s:.3f}",
+        },
+    )
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", _DEFAULT_PORT)))

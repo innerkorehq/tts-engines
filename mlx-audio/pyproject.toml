@@ -1,7 +1,7 @@
 [project]
 name = "tts-mlx-audio"
 version = "0.1.0"
-description = "Consolidated mlx-audio TTS CLI for vidgen — Qwen3-TTS, Chatterbox, Voxtral-TTS (native MLX/Apple Silicon). Kokoro deliberately excluded — see synth.py module docstring."
+description = "Consolidated mlx-audio TTS service — Qwen3-TTS, Chatterbox, Chatterbox-Multilingual, Voxtral-TTS, Higgs-TTS, Svara-TTS (native MLX/Apple Silicon)."
 requires-python = ">=3.11"
 dependencies = [
     # [tts] extra pulls in mistral-common[audio] + sentencepiece, needed by
@@ -9,6 +9,8 @@ dependencies = [
     "mlx-audio[tts]>=0.4.4",
     "soundfile>=0.12.1",
     "numpy",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
 ]
 
 [tool.uv]

@@ -1,7 +1,7 @@
 [project]
 name = "tts-f5tts"
 version = "0.1.0"
-description = "F5-TTS (SWivid/F5-TTS) synthesis daemon + fallback for vidgen"
+description = "F5-TTS (SWivid/F5-TTS) synthesis service"
 requires-python = ">=3.11"
 dependencies = [
     "f5-tts>=1.1.0",
@@ -10,6 +10,8 @@ dependencies = [
     "torchaudio>=2.2",
     "soundfile>=0.12.1",
     "cached-path>=1.6",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
 ]
 
 [tool.uv]

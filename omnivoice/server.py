@@ -1,76 +1,76 @@
 #!/usr/bin/env python
 """
-k2-fsa/OmniVoice persistent synthesis daemon.
+k2-fsa/OmniVoice synthesis service.
 
-`synth.py` (kept as-is, used as a one-shot fallback if this daemon fails to
-start) is invoked fresh for every scene — meaning the OmniVoice model gets
-reloaded onto MPS/CPU from scratch on every single narration clip. For a
-render with N scenes that's N full model loads instead of one.
+Loads the OmniVoice model ONCE at startup and serves synthesis requests over
+a small HTTP API (FastAPI) for the lifetime of the process.
 
-This script instead loads the model ONCE and then serves synthesis requests
-over a simple line-delimited JSON protocol on stdin/stdout, kept alive for the
-lifetime of the worker process — same pattern as `tts-engines/f5tts/f5tts_server.py`.
-
-Protocol (one JSON object per line, UTF-8, newline-terminated):
-    Request  -> {"text": "...", "out": "/abs/out.wav",
-                 "ref_audio": "/abs/ref.wav" (optional), "ref_text": "..." (optional)}
-    Response <- {"ok": true, "sample_rate": 24000, "duration_s": F}
-             <- {"ok": false, "error": "..."}
-A "READY" line is written to the protocol stdout once the model has finished
-loading, so the parent process knows when it's safe to start sending requests.
-A "SHUTDOWN" line (exact string, not JSON) exits cleanly.
+Endpoints:
+    GET  /health       -> {"status": "ok"} once the model has finished loading.
+    POST /synthesize    Request body:
+                           {"text": "...", "ref_audio": "/abs/ref.wav" (optional),
+                            "ref_text": "..." (optional),
+                            "out": "/path/to/out.wav" (optional)}
+                         If "out" is given, the server writes the WAV file to
+                         that path and responds with JSON:
+                           {"ok": true, "sample_rate": 24000, "duration_s": F}
+                         If "out" is omitted, the response body IS the WAV
+                         audio (Content-Type: audio/wav), with sample_rate/
+                         duration_s in the X-Sample-Rate/X-Duration-Seconds
+                         response headers.
+                         On error: an HTTP error status with a JSON
+                         {"detail": "..."} body.
 
 All inference behavior/parameters/defaults below are copied verbatim from
-`synth.py` — this is a structural refactor (cold-start-per-call ->
-warm-daemon-serves-many), not a behavior change. See that file's module
-docstring for the full rationale behind the short-text-degeneration retry
-logic and the MPS-OOM/CPU-fallback logic reproduced here.
+the original synth.py — this is a structural refactor (cold-start-per-call
+-> warm-service-serves-many), not a behavior change. See the short-text-
+degeneration retry logic and the MPS-OOM/CPU-fallback logic below.
+
+Run: uv run server.py   (or: uvicorn server:app --host 0.0.0.0 --port 8008)
+Env vars: PORT (default 8008)
 """
-import json
+import io
 import logging
 import os
-import sys
-import traceback
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
-# ── Protect the protocol stream from library noise ───────────────────────────
-# OmniVoice's own code (and/or its dependencies, e.g. torch/transformers) may
-# call bare `print(...)` during model loading and/or inference, which would
-# land on stdout and corrupt our line-delimited JSON protocol if left alone.
-# So: duplicate the *original* stdout fd into a dedicated file object reserved
-# exclusively for protocol messages (READY / JSON responses), then repoint
-# `sys.stdout` at stderr so every incidental `print()` from imported libraries
-# is harmless diagnostic noise instead of protocol corruption. This must
-# happen BEFORE any ML libraries are imported.
-_protocol_out = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
-sys.stdout = sys.stderr
+from fastapi import FastAPI, HTTPException, Response
+from pydantic import BaseModel
 
-
-def _send(line: str) -> None:
-    _protocol_out.write(line + "\n")
-    _protocol_out.flush()
-
-
-logging.basicConfig(level=logging.INFO, stream=sys.stderr)
-logger = logging.getLogger("omnivoice_server")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("omnivoice")
 
 _MODEL_ID = "k2-fsa/OmniVoice"
+_DEFAULT_PORT = 8008
+_SAMPLE_RATE = 24000
 
-# Quality gate for the short-text-degeneration issue (see synth.py's module
-# docstring). Thresholds derived from real samples: healthy short clips
-# ("API", "URL") measured rms/peak ~0.20; degenerate clips ("Hello", "GitHub"
-# — confirmed gibberish/silent via Whisper) measured rms/peak ~0.41-0.49
-# (continuous loud buzz, no pauses, unlike real speech which has
-# bursts/pauses pulling rms well below peak).
+# Quality gate for the short-text-degeneration issue. Thresholds derived
+# from real samples: healthy short clips ("API", "URL") measured rms/peak
+# ~0.20; degenerate clips ("Hello", "GitHub" — confirmed gibberish/silent
+# via Whisper) measured rms/peak ~0.41-0.49 (continuous loud buzz, no
+# pauses, unlike real speech which has bursts/pauses pulling rms well below
+# peak).
 _MIN_PEAK = 0.01
 _MAX_RMS_TO_PEAK_RATIO = 0.35
 _MAX_GENERATION_ATTEMPTS = 4
 
-# ── One-time model state (module scope so it naturally persists across every
-# request for the lifetime of this daemon process) ───────────────────────────
+# ── Model state ──────────────────────────────────────────────────────────
 _model = None
 _cpu_model = None
 _force_cpu = False  # sticky once an MPS OOM is hit — MPS is contended for the rest of this run
+
+
+def _from_pretrained_local_first(model_cls, **kwargs):
+    """local_files_only-first to avoid an unnecessary network round-trip
+    when the model is already cached. Falls back to a normal (network-
+    enabled) load only if nothing is cached yet."""
+    try:
+        return model_cls.from_pretrained(_MODEL_ID, local_files_only=True, **kwargs)
+    except Exception:
+        logger.info("Not fully cached locally yet — downloading %s…", _MODEL_ID)
+        return model_cls.from_pretrained(_MODEL_ID, **kwargs)
 
 
 def _get_model():
@@ -103,32 +103,15 @@ def _get_cpu_model():
     return _cpu_model
 
 
-def _from_pretrained_local_first(model_cls, **kwargs):
-    """
-    Unlike the one-shot synth.py (a brand-new subprocess per call, hence
-    local_files_only to avoid re-resolving every file over the network each
-    time), this daemon only ever calls this once per model per process
-    lifetime — but local_files_only-first is kept anyway since it's still
-    correct and avoids an unnecessary network round-trip on the (only) load.
-    Falls back to a normal (network-enabled) load only if nothing is cached
-    yet.
-    """
-    try:
-        return model_cls.from_pretrained(_MODEL_ID, local_files_only=True, **kwargs)
-    except Exception:
-        logger.info("Not fully cached locally yet — downloading %s…", _MODEL_ID)
-        return model_cls.from_pretrained(_MODEL_ID, **kwargs)
-
-
 def _is_mps_oom(exc: Exception) -> bool:
     return "out of memory" in str(exc).lower()
 
 
 def _generate(kwargs: dict):
     """Run model.generate(), falling back to a CPU copy of the model on an
-    MPS out-of-memory error (see synth.py's module docstring) instead of
-    failing. `_force_cpu` is process-lifetime state, so once tripped, every
-    subsequent request in this daemon uses the CPU model."""
+    MPS out-of-memory error instead of failing. `_force_cpu` is
+    process-lifetime state, so once tripped, every subsequent request uses
+    the CPU model."""
     global _force_cpu
 
     if not _force_cpu:
@@ -157,11 +140,8 @@ def _is_degenerate(audio) -> bool:
     return (rms / peak) > _MAX_RMS_TO_PEAK_RATIO
 
 
-def synthesise(text: str, out_path: str, ref_audio: str = "", ref_text: str = "") -> tuple[int, float]:
-    import soundfile as sf
-
-    sample_rate = 24000
-
+def _synthesise(text: str, ref_audio: str = "", ref_text: str = ""):
+    """Returns a (sample_rate, mono float32 PCM ndarray) tuple."""
     kwargs: dict = {"text": text}
     if ref_audio:
         kwargs["ref_audio"] = ref_audio
@@ -175,66 +155,81 @@ def synthesise(text: str, out_path: str, ref_audio: str = "", ref_text: str = ""
     while _is_degenerate(audio) and attempt < _MAX_GENERATION_ATTEMPTS:
         attempt += 1
         logger.warning(
-            "Generation %d produced degenerate audio (known short-text instability — "
-            "see synth.py's module docstring); retrying (attempt %d/%d)…",
+            "Generation %d produced degenerate audio (known short-text instability); "
+            "retrying (attempt %d/%d)…",
             attempt - 1, attempt, _MAX_GENERATION_ATTEMPTS,
         )
         audio = _generate(kwargs)
 
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    sf.write(out_path, audio, sample_rate)
-    return sample_rate, len(audio) / sample_rate
+    return _SAMPLE_RATE, audio
 
 
-def _load_models():
-    # Eagerly load the primary (MPS-or-CPU) model at startup, before READY is
-    # sent, so READY actually means "ready to serve" rather than "ready to
-    # lazily load on first request". The CPU fallback model is intentionally
-    # left lazy (_get_cpu_model) — it's only ever needed after an MPS OOM.
+# ── FastAPI app ──────────────────────────────────────────────────────────────
+
+_state: dict = {}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Eagerly load the primary (MPS-or-CPU) model at startup so /health
+    # actually means "ready to serve". The CPU fallback model is
+    # intentionally left lazy — it's only ever needed after an MPS OOM.
     logger.info("Loading OmniVoice model (one-time, this may take a while)…")
-    _get_model()
+    _state["model"] = _get_model()
     logger.info("Startup load complete.")
+    yield
 
 
-def _handle_request(req: dict) -> dict:
-    text = req.get("text", "")
-    out_path = req.get("out")
-    ref_audio = req.get("ref_audio", "")
-    ref_text = req.get("ref_text", "")
-
-    if not text.strip():
-        raise ValueError("text is empty")
-    if not out_path:
-        raise ValueError("out path is required")
-
-    sample_rate, duration_s = synthesise(text, out_path, ref_audio, ref_text)
-    return {"ok": True, "sample_rate": sample_rate, "duration_s": duration_s}
+app = FastAPI(title="omnivoice", lifespan=lifespan)
 
 
-def main() -> int:
-    _load_models()
+class SynthesizeRequest(BaseModel):
+    text: str
+    ref_audio: Optional[str] = None
+    ref_text: Optional[str] = None
+    out: Optional[str] = None
 
-    # Signal readiness to the parent process on the protected protocol stream
-    # (NOT via `print`, which now points at stderr).
-    _send("READY")
 
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        if line == "SHUTDOWN":
-            logger.info("Received SHUTDOWN — exiting.")
-            return 0
-        try:
-            req = json.loads(line)
-            resp = _handle_request(req)
-        except Exception as exc:  # noqa: BLE001 — must always answer the request
-            logger.error("Error handling request: %s\n%s", exc, traceback.format_exc())
-            resp = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        _send(json.dumps(resp))
+@app.get("/health")
+def health():
+    return {"status": "ok" if "model" in _state else "loading"}
 
-    return 0
+
+@app.post("/synthesize")
+def synthesize(req: SynthesizeRequest):
+    import soundfile as sf
+
+    if "model" not in _state:
+        raise HTTPException(status_code=503, detail="Model still loading — retry shortly.")
+    if not req.text.strip():
+        raise HTTPException(status_code=422, detail="text is empty")
+
+    try:
+        sample_rate, audio = _synthesise(req.text, req.ref_audio or "", req.ref_text or "")
+    except Exception as exc:
+        logger.exception("Synthesis failed")
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+
+    duration_s = len(audio) / sample_rate
+
+    if req.out:
+        Path(req.out).parent.mkdir(parents=True, exist_ok=True)
+        sf.write(req.out, audio, sample_rate)
+        return {"ok": True, "sample_rate": sample_rate, "duration_s": duration_s}
+
+    buf = io.BytesIO()
+    sf.write(buf, audio, sample_rate, format="WAV")
+    return Response(
+        content=buf.getvalue(),
+        media_type="audio/wav",
+        headers={
+            "X-Sample-Rate": str(sample_rate),
+            "X-Duration-Seconds": f"{duration_s:.3f}",
+        },
+    )
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", _DEFAULT_PORT)))

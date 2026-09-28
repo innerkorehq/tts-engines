@@ -1,7 +1,7 @@
 [project]
 name = "tts-f5tts-hinglish"
 version = "0.1.0"
-description = "F5-TTS-Hinglish (rajputsw/F5-TTS-Hinglish) voice-clone synthesis CLI for vidgen"
+description = "F5-TTS-Hinglish (rajputsw/F5-TTS-Hinglish) voice-clone synthesis service"
 requires-python = ">=3.11"
 dependencies = [
     "f5-tts",
@@ -9,6 +9,8 @@ dependencies = [
     "torch>=2.2",
     "torchaudio>=2.2",
     "soundfile>=0.12.1",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
 ]
 
 [tool.uv]

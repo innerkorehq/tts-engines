@@ -1,60 +1,49 @@
 #!/usr/bin/env python
 """
-Kokoro TTS persistent synthesis daemon.
+Kokoro TTS synthesis service.
 
-The original `synth.py` CLI is invoked fresh for every narration clip —
-meaning the Kokoro `KPipeline` (and the underlying model weights) gets
-reloaded from scratch on every single scene. For a render with N scenes
-that's N full model loads instead of one.
+Loads the Kokoro `KPipeline` ONCE at startup and serves synthesis requests
+over a small HTTP API (FastAPI) for the lifetime of the process — instead of
+paying a full model load on every single call.
 
-This script instead loads the KPipeline ONCE and then serves synthesis
-requests over a simple line-delimited JSON protocol on stdin/stdout, kept
-alive for the lifetime of the worker process — same pattern as
-`tts-engines/f5tts/f5tts_server.py`.
+Endpoints:
+    GET  /health       -> {"status": "ok"} once the model has finished loading.
+    POST /synthesize    Request body:
+                           {"text": "...", "voice": "af_heart", "speed": 1.0,
+                            "out": "/path/to/out.wav" (optional)}
+                         If "out" is given, the server writes the WAV file to
+                         that path (useful when the caller shares a
+                         filesystem/volume with this service, e.g. via
+                         docker-compose) and responds with JSON:
+                           {"ok": true, "sample_rate": 24000, "duration_s": 1.23}
+                         If "out" is omitted, the response body IS the WAV
+                         audio (Content-Type: audio/wav), with sample_rate/
+                         duration_s in the X-Sample-Rate/X-Duration-Seconds
+                         response headers — for any caller that doesn't share
+                         a filesystem with this service.
+                         On error: an HTTP error status with a JSON
+                         {"detail": "..."} body (FastAPI's standard shape).
 
-Protocol (one JSON object per line, UTF-8, newline-terminated):
-    Request  -> {"text": "...", "voice": "af_heart", "speed": 1.0, "out": "/path/to/out.wav"}
-    Response <- {"ok": true, "sample_rate": 24000, "duration_s": 1.23}
-             <- {"ok": false, "error": "..."}
-A "READY" line is written to the protocol stdout once the model has finished
-loading, so the parent process knows when it's safe to start sending
-requests. A bare "SHUTDOWN" line (not JSON) causes a clean exit.
+Run: uv run server.py   (or: uvicorn server:app --host 0.0.0.0 --port 8001)
+Env vars: PORT (default 8001), HF_HOME, HF_TOKEN
 """
-import json
+import io
 import logging
 import os
 import re
-import sys
-import traceback
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
-# ── Protect the protocol stream from library noise ───────────────────────────
-# Kokoro/misaki (and libraries it pulls in, e.g. for G2P/model loading) may
-# call bare `print(...)` during model load AND during inference, which would
-# land on stdout and corrupt our line-delimited JSON protocol if left alone.
-# So: duplicate the *original* stdout fd into a dedicated file object
-# reserved exclusively for protocol messages (READY / JSON responses), then
-# repoint `sys.stdout` at stderr so every incidental `print()` from imported
-# libraries is harmless diagnostic noise instead of protocol corruption.
-# This must happen BEFORE importing any ML libraries (kokoro, numpy, etc.).
-_protocol_out = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
-sys.stdout = sys.stderr
+from fastapi import FastAPI, HTTPException, Response
+from pydantic import BaseModel
 
-
-def _send(line: str) -> None:
-    _protocol_out.write(line + "\n")
-    _protocol_out.flush()
-
-
-logging.basicConfig(level=logging.INFO, stream=sys.stderr)
-logger = logging.getLogger("kokoro_server")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("kokoro")
 
 _TARGET_SR = 24_000
-
-
-def _log(msg: str) -> None:
-    """Diagnostic logging to stderr — stdout is reserved for the protocol."""
-    print(f"[kokoro_server] {msg}", file=sys.stderr, flush=True)
+_REPO = "hexgrad/Kokoro-82M"
+_DEFAULT_PORT = 8001
 
 
 # ── eSpeak phoneme code support via Kokoro/misaki ───────────────────────────
@@ -125,9 +114,6 @@ def _espeak_to_ipa(code: str) -> str:
     return _ESPEAK_RE.sub(lambda m: _ESPEAK_MAP.get(m.group(), m.group()), code)
 
 
-_REPO = "hexgrad/Kokoro-82M"
-
-
 def _repo_looks_cached(repo_id: str) -> bool:
     """
     Cheap heuristic: does this repo have at least one snapshot directory in
@@ -135,8 +121,7 @@ def _repo_looks_cached(repo_id: str) -> bool:
     huggingface_hub itself, since importing it (or anything that imports it,
     e.g. kokoro below) before HF_HUB_OFFLINE is set makes the env var a
     no-op (huggingface_hub reads it into a module-level constant at import
-    time, not dynamically per call). Same pattern as
-    chatterbox-multilingual-hi/server.py's identical helper.
+    time, not dynamically per call).
     """
     cache_dir = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser() / "hub"
     repo_dir = cache_dir / f"models--{repo_id.replace('/', '--')}"
@@ -145,35 +130,26 @@ def _repo_looks_cached(repo_id: str) -> bool:
 
 
 def _load_pipeline():
-    # One-time setup: import + construct the Kokoro KPipeline. This is the
-    # expensive step (may trigger a model download on first run) that the
-    # original synth.py paid on every single invocation via its lazy
-    # module-global `_get_pipeline()`. Here it happens exactly once, before
-    # READY is signalled, and the resulting object is reused for every
-    # subsequent request for the lifetime of this process.
-    #
     # kokoro's KPipeline uses huggingface_hub.hf_hub_download() unconditionally
     # for every file it needs (config/weights/voice packs) — no local-cache
     # check of its own, so without HF_HUB_OFFLINE it hits huggingface.co's API
-    # on every single daemon startup even when everything is already cached,
-    # and a transient HF Hub connectivity blip there crashes startup outright
-    # (confirmed in production: local-chat-mlx hit exactly this). Force
+    # on every single startup even when everything is already cached, and a
+    # transient HF Hub connectivity blip crashes startup outright. Force
     # offline mode once the repo is confirmed cached locally.
     if _repo_looks_cached(_REPO):
         os.environ["HF_HUB_OFFLINE"] = "1"
     else:
-        _log(f"Not fully cached locally yet — downloading {_REPO}…")
+        logger.info("Not fully cached locally yet — downloading %s…", _REPO)
 
     from kokoro import KPipeline
-    _log("Loading Kokoro KPipeline (one-time, first call may trigger model download)…")
+    logger.info("Loading Kokoro KPipeline (one-time, first call may trigger model download)…")
     pipeline = KPipeline(lang_code="a")
-    _log("Kokoro KPipeline ready.")
+    logger.info("Kokoro KPipeline ready.")
     return pipeline
 
 
-def _synthesise_plain(pipeline, text: str, voice: str, speed: float, out: str):
+def _synthesise_plain(pipeline, text: str, voice: str, speed: float):
     import numpy as np
-    import soundfile as sf
 
     audio_chunks = []
     for result in pipeline(text, voice=voice, speed=speed):
@@ -182,12 +158,10 @@ def _synthesise_plain(pipeline, text: str, voice: str, speed: float, out: str):
     if not audio_chunks:
         raise RuntimeError("Kokoro returned no audio chunks for the provided text.")
 
-    audio = np.concatenate(audio_chunks)
-    sf.write(out, audio, _TARGET_SR)
-    return _TARGET_SR, len(audio) / _TARGET_SR
+    return np.concatenate(audio_chunks)
 
 
-def _synthesise_mixed(pipeline, text: str, voice: str, speed: float, out: str):
+def _synthesise_mixed(pipeline, text: str, voice: str, speed: float):
     """
     Segment synthesis for text that contains [[eSpeak phoneme codes]].
 
@@ -197,7 +171,6 @@ def _synthesise_mixed(pipeline, text: str, voice: str, speed: float, out: str):
     subprocess, no sample-rate mismatch.
     """
     import numpy as np
-    import soundfile as sf
 
     pcm_parts = []
 
@@ -227,49 +200,83 @@ def _synthesise_mixed(pipeline, text: str, voice: str, speed: float, out: str):
     if not pcm_parts:
         raise RuntimeError(f"No audio produced for text: {text!r}")
 
-    audio = np.concatenate(pcm_parts)
-    sf.write(out, audio, _TARGET_SR)
-    return _TARGET_SR, len(audio) / _TARGET_SR
+    return np.concatenate(pcm_parts)
 
 
-def _handle_request(req: dict, pipeline) -> dict:
-    text = req.get("text", "")
-    voice = req.get("voice", "af_heart")
-    speed = req.get("speed", 1.0)
-    out = req["out"]
-
+def _synthesise(pipeline, text: str, voice: str, speed: float):
+    """Returns a (sample_rate, mono float32 PCM ndarray) tuple."""
     if _has_phoneme_codes(text):
-        sample_rate, duration_s = _synthesise_mixed(pipeline, text, voice, speed, out)
+        audio = _synthesise_mixed(pipeline, text, voice, speed)
     else:
-        sample_rate, duration_s = _synthesise_plain(pipeline, text, voice, speed, out)
+        audio = _synthesise_plain(pipeline, text, voice, speed)
+    return _TARGET_SR, audio
 
-    return {"ok": True, "sample_rate": sample_rate, "duration_s": duration_s}
+
+# ── FastAPI app ──────────────────────────────────────────────────────────────
+
+_state: dict = {}
 
 
-def main() -> int:
-    pipeline = _load_pipeline()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _state["pipeline"] = _load_pipeline()
+    yield
 
-    # Signal readiness to the parent process on the protected protocol stream
-    # (NOT via `print`, which now points at stderr).
-    _send("READY")
 
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        if line == "SHUTDOWN":
-            _log("Received SHUTDOWN — exiting.")
-            return 0
-        try:
-            req = json.loads(line)
-            resp = _handle_request(req, pipeline)
-        except Exception as exc:  # noqa: BLE001 — must always answer the request
-            _log(f"Error handling request: {exc}\n{traceback.format_exc()}")
-            resp = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        _send(json.dumps(resp))
+app = FastAPI(title="kokoro-tts", lifespan=lifespan)
 
-    return 0
+
+class SynthesizeRequest(BaseModel):
+    text: str
+    voice: str = "af_heart"
+    speed: float = 1.0
+    out: Optional[str] = None
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok" if "pipeline" in _state else "loading"}
+
+
+@app.post("/synthesize")
+def synthesize(req: SynthesizeRequest):
+    import soundfile as sf
+
+    pipeline = _state.get("pipeline")
+    if pipeline is None:
+        raise HTTPException(status_code=503, detail="Model still loading — retry shortly.")
+
+    try:
+        sample_rate, audio = _synthesise(pipeline, req.text, req.voice, req.speed)
+    except Exception as exc:
+        logger.exception("Synthesis failed")
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+
+    duration_s = len(audio) / sample_rate
+
+    if req.out:
+        # Co-located mode: caller shares a filesystem/volume with this
+        # service (e.g. docker-compose) and just wants the file written —
+        # same contract the original stdin/stdout daemon offered.
+        Path(req.out).parent.mkdir(parents=True, exist_ok=True)
+        sf.write(req.out, audio, sample_rate)
+        return {"ok": True, "sample_rate": sample_rate, "duration_s": duration_s}
+
+    # Standalone mode: no shared filesystem assumed — return the audio
+    # itself in the response body.
+    buf = io.BytesIO()
+    sf.write(buf, audio, sample_rate, format="WAV")
+    return Response(
+        content=buf.getvalue(),
+        media_type="audio/wav",
+        headers={
+            "X-Sample-Rate": str(sample_rate),
+            "X-Duration-Seconds": f"{duration_s:.3f}",
+        },
+    )
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", _DEFAULT_PORT)))

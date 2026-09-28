@@ -1,0 +1,67 @@
+# Bring up any subset of engines: `docker compose up kokoro f5tts supertonic`
+# Each engine is independent — none of them depend on each other.
+#
+# NOTE: chatterbox-multilingual-hi and mlx-audio depend on Apple's MLX
+# framework (Apple Silicon only) — their containers will fail to even
+# install their Python dependencies on this Linux-based compose setup. Run
+# those two natively (uv sync && uv run server.py) instead.
+services:
+  kokoro:
+    build: ./kokoro
+    ports: ["8001:8001"]
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+
+  chatterbox-multilingual-hi:
+    build: ./chatterbox-multilingual-hi
+    ports: ["8002:8002"]
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+
+  f5tts:
+    build: ./f5tts
+    ports: ["8003:8003"]
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+
+  f5tts-hinglish:
+    build: ./f5tts-hinglish
+    ports: ["8004:8004"]
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+
+  hinglish-tts:
+    build: ./hinglish-tts
+    ports: ["8005:8005"]
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+
+  indic-xlit:
+    build: ./indic-xlit
+    ports: ["8006:8006"]
+
+  mlx-audio:
+    build: ./mlx-audio
+    ports: ["8007:8007"]
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+
+  omnivoice:
+    build: ./omnivoice
+    ports: ["8008:8008"]
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+
+  supertonic:
+    build: ./supertonic
+    ports: ["8009:8009"]
+
+  indicf5:
+    build: ./indicf5
+    ports: ["8011:8011"]
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface

@@ -1,7 +1,7 @@
 [project]
 name = "tts-indicf5"
 version = "0.1.0"
-description = "IndicF5 voice-clone synthesis CLI for vidgen"
+description = "IndicF5 voice-clone synthesis service"
 requires-python = ">=3.11"
 dependencies = [
     "f5-tts @ git+https://github.com/ai4bharat/IndicF5.git",
@@ -13,6 +13,8 @@ dependencies = [
     "tokenizers==0.22.2",
     "protobuf==7.35.1",
     "soundfile>=0.12.1",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
 ]
 
 [tool.uv]

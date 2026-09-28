@@ -1,32 +1,48 @@
 #!/usr/bin/env python
 """
-IndicXlit transliteration CLI — used by the kokoro engine (indic-to-roman)
-and the "hinglish-lid" text pipeline's Route B (roman-to-indic).
+IndicXlit transliteration service — Indic-script <-> Roman-script
+transliteration for Hindi, Bengali, Punjabi, Gujarati, Odia, Tamil, Telugu,
+Kannada, and Malayalam.
 
-Request (stdin JSON):
-    {"mode": "indic-to-roman", "text": "..."}
-        Convert Indic-script runs (Devanagari, Bengali, Gurmukhi, Gujarati,
-        Odia, Tamil, Telugu, Kannada, Malayalam) to Roman-script
-        approximations, leaving Latin text/digits/punctuation untouched.
-        Response: {"ok": true, "text": "..."}
+Per-language IndicXlit engines are loaded lazily, on first use, and cached
+in memory for the lifetime of the process (there are 9 possible Indic
+languages plus arbitrary roman-to-indic targets — loading all of them
+upfront would be wasteful when a given deployment usually only ever needs
+one or two).
 
-    {"mode": "roman-to-indic", "words": ["kal", "chalo"], "lang": "hi"}
-        Transliterate a batch of Roman-script words (assumed already
-        language-tagged as `lang` by an upstream word-LID step — this mode
-        does NOT itself decide which words are Hindi) to their native-script
-        spelling. Response: {"ok": true, "translations": {"kal": "कल", ...}}
-        — a word that fails to transliterate maps to itself unchanged.
+Endpoints:
+    GET  /health   -> {"status": "ok"}
+    POST /transliterate
+        {"mode": "indic-to-roman", "text": "..."}
+            Convert Indic-script runs to Roman-script approximations,
+            leaving Latin text/digits/punctuation untouched.
+            Response: {"text": "..."}
 
-Response (stdout JSON): {"ok": false, "error": "..."} on failure.
+        {"mode": "roman-to-indic", "words": ["kal", "chalo"], "lang": "hi"}
+            Transliterate a batch of Roman-script words (assumed already
+            language-tagged as `lang` by an upstream word-LID step — this
+            mode does NOT itself decide which words are Hindi) to their
+            native-script spelling.
+            Response: {"translations": {"kal": "कल", ...}}
+            — a word that fails to transliterate maps to itself unchanged.
+
+        On error: an HTTP error status with a JSON {"detail": "..."} body.
+
+Run: uv run server.py   (or: uvicorn server:app --host 0.0.0.0 --port 8006)
+Env vars: PORT (default 8006)
 """
 import logging
+import os
 import re
-import sys
+from typing import Optional
 
-from protocol import read_request, succeed, fail
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
-logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("indic-xlit")
+
+_DEFAULT_PORT = 8006
 
 
 # ── IndicXlit engine loading (with fairseq/torch compat shims) ──────────────
@@ -143,11 +159,10 @@ def transliterate_indic_to_roman(text: str) -> str:
 # ── Roman → Indic (used by the "hinglish-lid" text pipeline's Route B) ─────
 #
 # Opposite direction from above: takes Roman-script words already tagged HI
-# by an upstream word-LID step (see tts-engines/text-pipeline/synth.py's
-# word-lid engine) and transliterates each into `lang`'s native script.
-# Kept as a separate engine cache (`_roman_to_indic_engines`) from
-# `_indic_to_roman_engines` above — XlitEngine instances are direction-
-# specific (src_script_type="roman" vs "indic"), not interchangeable.
+# by an upstream word-LID step and transliterates each into `lang`'s native
+# script. Kept as a separate engine cache from `_indic_to_roman_engines`
+# above — XlitEngine instances are direction-specific (src_script_type=
+# "roman" vs "indic"), not interchangeable.
 
 _roman_to_indic_engines: dict[str, object] = {}
 
@@ -156,10 +171,9 @@ def transliterate_roman_to_indic(words: list[str], lang: str) -> dict[str, str]:
     """
     Transliterate each word in `words` from Roman script to `lang`'s native
     script. Returns a dict mapping original -> transliterated word; a word
-    that fails to transliterate maps to itself unchanged. Caller (Route B in
-    text_pipelines.py) is responsible for only passing words a word-LID step
-    actually tagged as belonging to `lang` — this function does no language
-    detection of its own.
+    that fails to transliterate maps to itself unchanged. Caller is
+    responsible for only passing words a word-LID step actually tagged as
+    belonging to `lang` — this function does no language detection of its own.
     """
     engine = _roman_to_indic_engines.get(lang)
     if engine is None:
@@ -184,40 +198,43 @@ def transliterate_roman_to_indic(words: list[str], lang: str) -> dict[str, str]:
     return out
 
 
-# ── Entry point ───────────────────────────────────────────────────────────
+# ── FastAPI app ──────────────────────────────────────────────────────────────
 
-def main() -> None:
-    req = read_request()
-    mode = req.get("mode")
+app = FastAPI(title="indic-xlit")
 
-    # ai4bharat-transliteration / pydload print download-progress and status
-    # messages directly to stdout via `print()`, which would corrupt our
-    # single-line JSON response. Redirect Python-level stdout to stderr for
-    # the duration of the work, restoring it only to write the response.
-    real_stdout = sys.stdout
-    sys.stdout = sys.stderr
+
+class TransliterateRequest(BaseModel):
+    mode: str
+    text: Optional[str] = None
+    words: Optional[list[str]] = None
+    lang: str = "hi"
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/transliterate")
+def transliterate(req: TransliterateRequest):
     try:
-        if mode == "indic-to-roman":
-            text = req.get("text", "")
-            result_fields = {"text": transliterate_indic_to_roman(text)}
-        elif mode == "roman-to-indic":
-            words = req.get("words", [])
-            lang = req.get("lang", "hi")
-            result_fields = {"translations": transliterate_roman_to_indic(words, lang)}
+        if req.mode == "indic-to-roman":
+            return {"text": transliterate_indic_to_roman(req.text or "")}
+        elif req.mode == "roman-to-indic":
+            return {"translations": transliterate_roman_to_indic(req.words or [], req.lang)}
         else:
-            sys.stdout = real_stdout
-            fail(f"Unknown mode: {mode!r} (expected 'indic-to-roman' or 'roman-to-indic')")
-            return
-    except Exception as e:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Unknown mode: {req.mode!r} (expected 'indic-to-roman' or 'roman-to-indic')",
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
         logger.exception("Transliteration failed")
-        sys.stdout = real_stdout
-        fail(str(e))
-        return
-    finally:
-        sys.stdout = real_stdout
-
-    succeed(**result_fields)
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
 
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", _DEFAULT_PORT)))
