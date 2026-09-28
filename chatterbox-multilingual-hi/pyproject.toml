@@ -1,25 +1,12 @@
 [project]
 name = "tts-chatterbox-multilingual-hi"
-version = "0.1.0"
-description = "Chatterbox-Multilingual-hi (Hindi) voice-clone synthesis CLI for vidgen"
+version = "0.2.0"
+description = "Chatterbox-Multilingual-hi (Hindi) voice-clone synthesis CLI for vidgen — MLX (Apple Silicon) via mlx-audio"
 requires-python = ">=3.11"
 dependencies = [
-    # PyPI's 0.1.7 (latest published release) predates the `t3_model` kwarg
-    # on ChatterboxMultilingualTTS.from_pretrained() needed to select the v3
-    # base checkpoint pairing this engine's Hindi finetune (t3_hi.safetensors,
-    # from the "V3 Single Language Pack" series) is built on — pinned to
-    # GitHub master instead, which has it.
-    "chatterbox-tts @ git+https://github.com/resemble-ai/chatterbox.git",
-    "transformers==5.2.0",
-    "torch>=2.2",
-    "torchaudio>=2.2",
-    "safetensors",
+    "mlx-audio[tts]>=0.4.4",
     "soundfile>=0.12.1",
-    # resemble-perth (chatterbox-tts's watermarker) imports `pkg_resources`
-    # at import time, which is no longer vendored into venvs by default.
-    "setuptools",
-    "numba>=0.59",
-    "llvmlite>=0.42",
+    "numpy",
 ]
 
 [tool.uv]
