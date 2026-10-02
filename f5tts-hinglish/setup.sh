@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-uv venv --python 3.11
+uv venv --python 3.13
 uv sync
 
 echo "f5tts-hinglish venv ready: tts-engines/f5tts-hinglish/.venv"

@@ -18,7 +18,7 @@ for the same voice skip that work.
 ## Run it
 
 ```bash
-uv venv --python 3.11 && uv sync   # or: bash setup.sh
+uv venv --python 3.13 && uv sync   # or: bash setup.sh
 uv run server.py                    # PORT=8003 by default
 ```
 

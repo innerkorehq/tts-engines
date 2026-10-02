@@ -2,7 +2,7 @@
 name = "tts-omnivoice"
 version = "0.1.0"
 description = "k2-fsa/OmniVoice TTS service (official PyTorch package, not the mlx-audio port)"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
     "omnivoice>=0.1.5",
     "torch>=2.4",

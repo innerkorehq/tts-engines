@@ -2,7 +2,7 @@
 name = "tts-indicf5"
 version = "0.1.0"
 description = "IndicF5 voice-clone synthesis service"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
     "f5-tts @ git+https://github.com/ai4bharat/IndicF5.git",
     "transformers==5.2.0",

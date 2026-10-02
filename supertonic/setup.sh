@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-uv venv --python 3.11
+uv venv --python 3.13
 uv sync
 
 echo "supertonic venv ready: tts-engines/supertonic/.venv"

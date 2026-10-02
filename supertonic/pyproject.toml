@@ -2,7 +2,7 @@
 name = "tts-supertonic"
 version = "0.1.0"
 description = "Supertonic TTS 3 synthesis service — ONNX-based, 44.1kHz, 31-language, CPU-only, preset voices M1-M5/F1-F5."
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
     "supertonic>=1.3.1",
     "soundfile>=0.12.1",

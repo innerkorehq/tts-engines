@@ -2,7 +2,7 @@
 name = "tts-f5tts"
 version = "0.1.0"
 description = "F5-TTS (SWivid/F5-TTS) synthesis service"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
     "f5-tts>=1.1.0",
     "huggingface-hub>=0.25",

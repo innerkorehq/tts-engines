@@ -2,7 +2,7 @@
 name = "tts-mlx-audio"
 version = "0.1.0"
 description = "Consolidated mlx-audio TTS service — Qwen3-TTS, Chatterbox, Chatterbox-Multilingual, Voxtral-TTS, Higgs-TTS, Svara-TTS (native MLX/Apple Silicon)."
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
     # [tts] extra pulls in mistral-common[audio] + sentencepiece, needed by
     # Voxtral-TTS specifically.

@@ -24,7 +24,7 @@ process. Includes two runtime patches applied to IndicF5's own
 
 ```bash
 export HF_TOKEN=hf_...   # ai4bharat/IndicF5 is gated
-uv venv --python 3.11 && uv sync   # or: bash setup.sh
+uv venv --python 3.13 && uv sync   # or: bash setup.sh
 uv run server.py                    # PORT=8011 by default
 ```
 

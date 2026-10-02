@@ -36,10 +36,17 @@ See each engine's own `README.md` for its exact request schema.
 Each engine directory is independent:
 
 ```bash
-cd kokoro
-uv venv --python 3.11 && uv sync   # or: bash setup.sh
+cd supertonic
+uv venv --python 3.13 && uv sync   # or: bash setup.sh
 uv run server.py
 ```
+
+**Python versions:** engines target Python 3.13, except `kokoro`,
+`indic-xlit` and `hinglish-tts`, which stay on 3.11 — `kokoro`'s
+`curated-tokenizers` (via misaki/spacy-curated-transformers) is source-only
+and its Cython build fails on 3.13, and `indic-xlit`/`hinglish-tts` depend on
+fairseq 0.12.2, whose `hydra-core`/`antlr4` pins import `typing.io` (removed in
+3.13). Each engine's own `setup.sh`/`pyproject.toml` is authoritative.
 
 Or with Docker (where supported — MLX-based engines can't run in a Linux
 container; see their individual READMEs):

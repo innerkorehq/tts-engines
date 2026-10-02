@@ -12,7 +12,7 @@ in this repo that runs anywhere (Linux, macOS, Windows).
 ## Run it
 
 ```bash
-uv venv --python 3.11 && uv sync   # or: bash setup.sh
+uv venv --python 3.13 && uv sync   # or: bash setup.sh
 uv run server.py                    # PORT=8009 by default
 ```
 

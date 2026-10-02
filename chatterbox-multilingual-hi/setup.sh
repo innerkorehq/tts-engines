@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-uv venv --python 3.11
+uv venv --python 3.13
 uv sync
 
 echo "chatterbox-multilingual-hi venv ready: tts-engines/chatterbox-multilingual-hi/.venv"

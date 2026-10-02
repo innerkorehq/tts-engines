@@ -18,7 +18,7 @@ voice/model repeatedly.
 ## Run it
 
 ```bash
-uv venv --python 3.11 && uv sync   # or: bash setup.sh
+uv venv --python 3.13 && uv sync   # or: bash setup.sh
 uv run server.py                    # PORT=8007 by default
 ```
 
