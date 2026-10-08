@@ -11,7 +11,7 @@ uv sync
 # mlx-audio's safetensors loader (framework="mlx") can't read bfloat16 and
 # its fallback (framework="pt") requires torch, which is not in this venv.
 # Patch: add a pure-numpy BF16 reader and use it when torch isn't available.
-HIGGS_CODEC=".venv/lib/python3.11/site-packages/mlx_audio/codec/models/higgs_audio/higgs_audio.py"
+HIGGS_CODEC=".venv/lib/python3.13/site-packages/mlx_audio/codec/models/higgs_audio/higgs_audio.py"
 SENTINEL="# vidgen-bf16-patch"
 if ! grep -q "$SENTINEL" "$HIGGS_CODEC" 2>/dev/null; then
   python3 - "$HIGGS_CODEC" <<'PATCHEOF'

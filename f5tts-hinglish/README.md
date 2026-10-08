@@ -14,7 +14,7 @@ process.
 
 ```bash
 uv venv --python 3.13 && uv sync   # or: bash setup.sh
-uv run server.py                    # PORT=8004 by default
+uv run --extra http server.py                    # PORT=8004 by default
 ```
 
 ## API

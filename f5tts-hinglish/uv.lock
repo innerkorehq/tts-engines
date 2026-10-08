@@ -3210,24 +3210,29 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "f5-tts" },
-    { name = "fastapi" },
     { name = "huggingface-hub" },
     { name = "soundfile" },
     { name = "torch" },
     { name = "torchaudio" },
+]
+
+[package.optional-dependencies]
+http = [
+    { name = "fastapi" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "f5-tts" },
-    { name = "fastapi", specifier = ">=0.115" },
+    { name = "fastapi", marker = "extra == 'http'", specifier = ">=0.115" },
     { name = "huggingface-hub", specifier = ">=0.25" },
     { name = "soundfile", specifier = ">=0.12.1" },
     { name = "torch", specifier = ">=2.2" },
     { name = "torchaudio", specifier = ">=2.2" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
+    { name = "uvicorn", extras = ["standard"], marker = "extra == 'http'", specifier = ">=0.30" },
 ]
+provides-extras = ["http"]
 
 [[package]]
 name = "typer"

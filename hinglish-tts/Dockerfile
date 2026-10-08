@@ -11,7 +11,7 @@ COPY inference.py setup.sh ./
 COPY scoring ./scoring
 RUN bash setup.sh
 
-COPY server.py ./
+COPY engine.py server.py ./
 
 ENV PORT=8005
 EXPOSE 8005

@@ -15,7 +15,7 @@ heuristic on the generated audio.
 
 ```bash
 uv venv --python 3.13 && uv sync   # or: bash setup.sh
-uv run server.py                    # PORT=8008 by default
+uv run --extra http server.py                    # PORT=8008 by default
 ```
 
 Model weights download lazily from `k2-fsa/OmniVoice` on first startup.

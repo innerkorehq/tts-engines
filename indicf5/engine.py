@@ -1,0 +1,260 @@
+"""
+IndicF5 (ai4bharat/IndicF5) synthesis service.
+
+Plain library module (no HTTP framework). Contract shared by every engine:
+    load()         load the model once (idempotent)
+    is_ready()     whether load() has finished
+    run(request)   handle one request dict -> result dict; failures raise EngineError
+With an "out" path the result is {"ok": True, "sample_rate": ..., "duration_s": ...} after writing
+the WAV there; without one, the same dict plus "wav_bytes". vidgen calls this in-process (no HTTP);
+server.py is an optional HTTP wrapper for standalone use.
+
+Env vars: PORT (default 8011), HF_TOKEN (ai4bharat/IndicF5 is gated)
+"""
+import glob
+import io
+import logging
+import os
+import shutil
+import tempfile
+from dataclasses import dataclass, fields as _dc_fields
+from pathlib import Path
+from typing import Optional
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("indicf5")
+
+NAME = "indicf5"
+ROUTE = "/synthesize"
+DEFAULT_PORT = 8011
+
+
+class EngineError(Exception):
+    def __init__(self, detail: str, status: int = 500):
+        super().__init__(detail)
+        self.detail = detail
+        self.status = status
+
+def _patch_indicf5_for_mps() -> None:
+    """
+    IndicF5 ships its model code via HF `trust_remote_code` (downloaded to
+    ~/.cache/huggingface/modules/transformers_modules/ai4bharat/IndicF5/<rev>/model.py).
+    That file hardcodes:
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    — i.e. it never considers Apple Silicon's MPS backend, so on macOS it
+    always falls back to CPU (slow). Patch the cached file in-place to add an
+    MPS branch. Idempotent (checks a marker before writing) and self-heals if
+    HF re-downloads a fresh copy of the file.
+    """
+    try:
+        import torch
+        if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+            return  # nothing to do on non-Apple-Silicon machines
+    except Exception:
+        return
+
+    cache_root = os.path.expanduser("~/.cache/huggingface/modules/transformers_modules/ai4bharat/IndicF5")
+    marker = "torch.backends.mps.is_available()"
+    old = 'device = torch.device("cuda" if torch.cuda.is_available() else "cpu")'
+    new = (
+        'device = torch.device(\n'
+        '            "cuda" if torch.cuda.is_available()\n'
+        '            else "mps" if torch.backends.mps.is_available()\n'
+        '            else "cpu"\n'
+        '        )'
+    )
+
+    for path in glob.glob(os.path.join(cache_root, "*", "model.py")):
+        try:
+            src = open(path, "r", encoding="utf-8").read()
+            if marker in src:
+                continue  # already patched
+            if old not in src:
+                logger.warning("IndicF5 model.py at %s has unexpected device-selection code — skipping MPS patch.", path)
+                continue
+            patched = src.replace(old, new, 1)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(patched)
+            shutil.rmtree(os.path.join(os.path.dirname(path), "__pycache__"), ignore_errors=True)
+            logger.info("Patched IndicF5 model.py for Apple Silicon MPS support: %s", path)
+        except Exception as e:
+            logger.warning("Could not patch IndicF5 model.py at %s for MPS: %s", path, e)
+
+
+# f5_tts.infer.utils_infer.infer_process() (vendored into IndicF5's model.py
+# via `from f5_tts.infer.utils_infer import ...`) computes the output audio
+# canvas size from UTF-8 *byte* counts of the reference/generation texts:
+#
+#   ref_text_len = len(ref_text.encode("utf-8"))
+#   gen_text_len = len(gen_text.encode("utf-8"))
+#
+# Devanagari encodes as ~3 bytes/char vs ~1 byte/char for ASCII. For
+# Roman-script input this under-allocates canvas relative to a Devanagari
+# generation text, truncating the synthesised audio. Counting non-whitespace
+# *characters* instead fixes the ref:gen ratio regardless of script. This
+# mirrors the "Mode A" duration fix from https://github.com/harrrshall/hinglish-tts.
+_DURATION_ORIG_BLOCK = (
+    '            # Calculate duration\n'
+    '            ref_text_len = len(ref_text.encode("utf-8"))\n'
+    '            gen_text_len = len(gen_text.encode("utf-8"))\n'
+)
+_DURATION_PATCHED_BLOCK = (
+    '            # PATCHED — character-count proportional duration (Mode A fix)\n'
+    '            ref_text_len = sum(1 for c in ref_text if not c.isspace())  # indicf5-patch\n'
+    '            gen_text_len = sum(1 for c in gen_text if not c.isspace())\n'
+)
+_DURATION_SENTINEL = "indicf5-patch"
+
+
+def _patch_indicf5_duration_canvas() -> None:
+    """Patch the installed f5_tts package's utils_infer.py in place — see block comment above."""
+    try:
+        import f5_tts.infer.utils_infer as _utils_infer
+    except Exception:
+        logger.warning("IndicF5 duration patch: f5_tts not importable — skipping.")
+        return
+
+    path = _utils_infer.__file__
+    try:
+        src = open(path, "r", encoding="utf-8").read()
+        if _DURATION_SENTINEL in src:
+            return  # already patched
+        if _DURATION_ORIG_BLOCK not in src:
+            logger.warning("IndicF5 duration patch: utils_infer.py at %s has unexpected code — skipping.", path)
+            return
+        patched = src.replace(_DURATION_ORIG_BLOCK, _DURATION_PATCHED_BLOCK, 1)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(patched)
+        shutil.rmtree(os.path.join(os.path.dirname(path), "__pycache__"), ignore_errors=True)
+        logger.info("Patched f5_tts utils_infer.py for character-count duration: %s", path)
+    except Exception as e:
+        logger.warning("Could not patch f5_tts utils_infer.py at %s for duration: %s", path, e)
+
+
+def _load_model():
+    """Load ai4bharat/IndicF5 via transformers.AutoModel(trust_remote_code=True)."""
+    import torch as _torch
+    import transformers.modeling_utils as _mu
+    from transformers import AutoModel
+
+    _patch_indicf5_for_mps()
+    _patch_indicf5_duration_canvas()
+
+    # transformers ALWAYS constructs `cls(config, ...)` inside a meta-device
+    # context (regardless of `low_cpu_mem_usage`). IndicF5's custom __init__
+    # loads its own vocoder checkpoint and calls plain `.to(device)` on it —
+    # that blows up with "Cannot copy out of meta tensor; no data!" because
+    # the vocoder submodules were created on the meta device. Temporarily
+    # strip the meta-device context so the whole model (including the
+    # vocoder loaded inside __init__) is built with real, materialised
+    # tensors.
+    _PTM = _mu.PreTrainedModel
+    _orig_get_init_context = _PTM.get_init_context.__func__
+
+    @classmethod
+    def _get_init_context_no_meta(cls_, dtype, is_quantized, _is_ds_init_called):
+        contexts = _orig_get_init_context(cls_, dtype, is_quantized, _is_ds_init_called)
+        return [c for c in contexts if c != _torch.device("meta")]
+
+    # IndicF5's custom INF5Model.__init__ calls `super().__init__(config)` but
+    # never calls `self.post_init()` (its code predates the transformers
+    # version that requires it). Without it, `all_tied_weights_keys` /
+    # `_tp_plan` / `_no_split_modules` etc. are never set, and
+    # `_finalize_model_loading` blows up. Run `post_init()` retroactively —
+    # it only computes this metadata from the already-built module tree.
+    _orig_finalize = _PTM._finalize_model_loading
+
+    @staticmethod
+    def _finalize_model_loading_compat(model, load_config, loading_info):
+        if not hasattr(model, "all_tied_weights_keys"):
+            model.post_init()
+        return _orig_finalize(model, load_config, loading_info)
+
+    _PTM.get_init_context = _get_init_context_no_meta
+    _PTM._finalize_model_loading = _finalize_model_loading_compat
+    try:
+        logger.info("Loading IndicF5 model from ai4bharat/IndicF5…")
+        try:
+            model = AutoModel.from_pretrained(
+                "ai4bharat/IndicF5", trust_remote_code=True, low_cpu_mem_usage=False, local_files_only=True,
+            )
+        except Exception:
+            logger.info("Not fully cached locally yet — downloading ai4bharat/IndicF5…")
+            model = AutoModel.from_pretrained("ai4bharat/IndicF5", trust_remote_code=True, low_cpu_mem_usage=False)
+    finally:
+        _PTM.get_init_context = classmethod(_orig_get_init_context)
+        _PTM._finalize_model_loading = staticmethod(_orig_finalize)
+    logger.info("IndicF5 model ready.")
+    return model
+
+
+def _synthesise(model, text: str, ref_audio: str, ref_text: str):
+    """Returns a (sample_rate, mono float32 PCM ndarray) tuple."""
+    import numpy as np
+
+    audio = model(text, ref_audio_path=ref_audio, ref_text=ref_text)
+    if hasattr(audio, "dtype") and audio.dtype == np.int16:
+        audio = audio.astype(np.float32) / 32768.0
+
+    audio = np.array(audio, dtype=np.float32)
+    return 24000, audio
+
+
+@dataclass
+class SynthesizeRequest:
+    text: str
+    ref_audio: str
+    ref_text: str
+    out: Optional[str] = None
+
+
+_state: dict = {}
+_loaded = False
+
+
+def load() -> None:
+    global _loaded
+    if _loaded:
+        return
+    logger.info("Loading IndicF5 model (one-time, this may take a while)…")
+    _state["model"] = _load_model()
+    logger.info("Model ready.")
+    _loaded = True
+
+
+def is_ready() -> bool:
+    return _loaded
+
+
+def run(request: dict) -> dict:
+    load()
+    try:
+        fields_ = {k: v for k, v in request.items() if k in {f.name for f in _dc_fields(SynthesizeRequest)}}
+        req = SynthesizeRequest(**fields_)
+    except TypeError as exc:
+        raise EngineError(f"invalid request: {exc}", 422) from exc
+    import soundfile as sf
+
+    model = _state.get("model")
+    if model is None:
+        raise EngineError("Model still loading — retry shortly.", 503)
+
+    try:
+        sample_rate, audio = _synthesise(model, req.text, req.ref_audio, req.ref_text)
+    except Exception as exc:
+        logger.exception("Synthesis failed")
+        raise EngineError(f"{type(exc).__name__}: {exc}", 500) from exc
+
+    duration_s = len(audio) / sample_rate
+
+    if req.out:
+        Path(req.out).parent.mkdir(parents=True, exist_ok=True)
+        sf.write(req.out, audio, samplerate=sample_rate)
+        return {"ok": True, "sample_rate": sample_rate, "duration_s": duration_s}
+
+    buf = io.BytesIO()
+    sf.write(buf, audio, samplerate=sample_rate, format="WAV")
+    return {"ok": True, "sample_rate": sample_rate, "duration_s": float(duration_s), "wav_bytes": buf.getvalue()}

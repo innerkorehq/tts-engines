@@ -21,7 +21,7 @@ cold-start-per-call script.
 ```bash
 export HF_TOKEN=hf_...   # ai4bharat/IndicF5 is gated
 bash setup.sh
-uv run server.py          # PORT=8005 by default
+uv run --extra http server.py          # PORT=8005 by default
 ```
 
 (`setup.sh` installs via a curated set of `pip install` commands mirroring

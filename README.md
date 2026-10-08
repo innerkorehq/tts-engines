@@ -1,18 +1,23 @@
 # tts-engines
 
 A collection of independent, self-contained text-to-speech engines, each
-its own HTTP service with its own isolated dependencies (several have
-mutually incompatible requirements — that's why they're separate, not a
-historical accident).
+with its own isolated dependencies (several have mutually incompatible
+requirements — that's why they're separate, not a historical accident).
 
-Every engine exposes the same shape of API:
-- `GET /health` — readiness check.
-- `POST /synthesize` — synthesize speech. If the request includes an `out`
-  path, the service writes the WAV file there (for callers that share a
-  filesystem/volume with the service) and responds with a small JSON status
-  object. If `out` is omitted, the response body *is* the WAV audio
-  (`Content-Type: audio/wav`) — for any caller, anywhere.
-- Errors are a normal HTTP error status with a JSON `{"detail": "..."}` body.
+Every engine is a **plain Python library module** (`<engine>/engine.py`, no
+web framework) with the same contract:
+- `load()` — load the model once (idempotent); `is_ready()`.
+- `run(request: dict) -> dict` — synthesize. With an `out` path it writes the
+  WAV there and returns `{"ok": True, "sample_rate": ..., "duration_s": ...}`;
+  without `out` the result also carries `"wav_bytes"`. Failures raise
+  `EngineError`.
+
+Use it in-process from the engine's own venv (`bash setup.sh`, then
+`import engine; engine.load(); engine.run({...})`), or through vidgen's engines
+library, which runs each engine in its own venv over stdin/stdout — no HTTP and
+no ports. Each engine also ships an **optional** thin HTTP wrapper
+(`server.py`, `GET /health` + `POST <route>`) for standalone use; it needs
+`uv sync --extra http` and is not used by vidgen.
 
 See each engine's own `README.md` for its exact request schema.
 

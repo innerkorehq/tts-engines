@@ -13,7 +13,7 @@ Locally:
 
 ```bash
 uv venv --python 3.11 && uv sync   # or: bash setup.sh
-uv run server.py                    # PORT=8001 by default
+uv run --extra http server.py                    # PORT=8001 by default
 ```
 
 With Docker:

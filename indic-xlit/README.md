@@ -13,7 +13,7 @@ one or two.
 
 ```bash
 bash setup.sh
-uv run server.py   # PORT=8006 by default
+uv run --extra http server.py   # PORT=8006 by default
 ```
 
 ## API

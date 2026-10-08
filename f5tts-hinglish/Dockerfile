@@ -8,9 +8,9 @@ RUN pip install --no-cache-dir uv
 
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
-RUN uv venv --python 3.13 && uv sync --frozen
+RUN uv venv --python 3.13 && uv sync --frozen --extra http
 
-COPY server.py ./
+COPY engine.py server.py ./
 
 ENV PORT=8004
 EXPOSE 8004

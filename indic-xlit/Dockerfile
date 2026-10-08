@@ -10,7 +10,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock setup.sh ./
 RUN bash setup.sh
 
-COPY server.py ./
+COPY engine.py server.py ./
 
 ENV PORT=8006
 EXPOSE 8006

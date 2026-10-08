@@ -16,7 +16,7 @@ reference-audio-to-speaker-embedding pass via an on-disk cache (see below).
 
 ```bash
 uv venv --python 3.13 && uv sync   # or: bash setup.sh
-uv run server.py                    # PORT=8002 by default
+uv run --extra http server.py                    # PORT=8002 by default
 ```
 
 ## API

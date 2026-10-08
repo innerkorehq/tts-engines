@@ -13,7 +13,7 @@ in this repo that runs anywhere (Linux, macOS, Windows).
 
 ```bash
 uv venv --python 3.13 && uv sync   # or: bash setup.sh
-uv run server.py                    # PORT=8009 by default
+uv run --extra http server.py                    # PORT=8009 by default
 ```
 
 With Docker:
