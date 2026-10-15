@@ -14,7 +14,7 @@ Env vars: PORT (default 8006)
 """
 from dataclasses import dataclass, fields as _dc_fields
 import logging
-import os
+from pathlib import Path
 import re
 from typing import Optional
 
@@ -34,6 +34,49 @@ class EngineError(Exception):
         self.status = status
 
 # ── IndicXlit engine loading (with fairseq/torch compat shims) ──────────────
+
+def _hf_snapshot(repo_id: str, revision: str | None = None, allow_patterns=None) -> str:
+    """Path of `repo_id` in the central Hugging Face cache (~/.cache/huggingface,
+    or $HF_HOME), downloading it there only if it isn't cached yet — weights
+    must never live in the engine's directory or venv."""
+    from huggingface_hub import snapshot_download
+
+    kwargs = dict(repo_id=repo_id, revision=revision, allow_patterns=allow_patterns)
+    try:
+        return snapshot_download(local_files_only=True, **kwargs)  # no network when cached
+    except Exception:
+        return snapshot_download(**kwargs)
+
+
+def _link_xlit_models_from_hf() -> None:
+    """ai4bharat-transliteration downloads its checkpoints from a GitHub
+    release into its own package directory (inside the venv). Instead, fetch
+    them from the central HF cache (ai4bharat/IndicXlit) and symlink them to
+    where the library looks, so it finds them and never downloads. Only the
+    symlinks live in the venv; the bytes live in the HF cache."""
+    import importlib.util
+    import shutil
+
+    spec = importlib.util.find_spec("ai4bharat.transliteration")
+    models_root = Path(spec.submodule_search_locations[0]) / "transformer" / "models"
+    snapshot = Path(_hf_snapshot(
+        "ai4bharat/IndicXlit",
+        allow_patterns=["indicxlit-*/transformer/*", "indicxlit-*/corpus-bin/*"],
+    ))
+    for direction, hf_dir in (("indic2en", "indicxlit-indic-en-v1.0"), ("en2indic", "indicxlit-en-indic-v1.0")):
+        version_dir = models_root / direction / "v1.0"
+        version_dir.mkdir(parents=True, exist_ok=True)
+        for part in ("corpus-bin", "transformer"):
+            target = snapshot / hf_dir / part
+            link = version_dir / part
+            if link.is_symlink() and link.resolve() == target.resolve():
+                continue
+            if link.is_symlink():
+                link.unlink()
+            elif link.exists():
+                shutil.rmtree(link)  # a previous direct download inside the venv
+            link.symlink_to(target)
+
 
 def _load_xlit_engine(lang: str, src_script_type: str):
     """
@@ -76,9 +119,14 @@ def _load_xlit_engine(lang: str, src_script_type: str):
     _dataclasses._get_field = _get_field_compat
     _torch.load = _torch_load_compat
     try:
+        _link_xlit_models_from_hf()
         from ai4bharat.transliteration import XlitEngine
         logger.info("Loading IndicXlit (lang=%s, src_script_type=%s)…", lang, src_script_type)
-        engine = XlitEngine(lang, beam_width=4, src_script_type=src_script_type)
+        # rescore=False: the rescoring word-frequency dictionaries are only
+        # published as a GitHub-release zip (7+ GB for en->indic, downloaded
+        # into the venv) and aren't on Hugging Face; the checkpoints alone
+        # (from the HF cache) produce the transliteration.
+        engine = XlitEngine(lang, beam_width=4, src_script_type=src_script_type, rescore=False)
         logger.info("IndicXlit ready.")
         return engine
     finally:

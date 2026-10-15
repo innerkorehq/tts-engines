@@ -21,6 +21,14 @@ no ports. Each engine also ships an **optional** thin HTTP wrapper
 
 See each engine's own `README.md` for its exact request schema.
 
+## Model weights
+
+Every engine loads its weights from the **central Hugging Face cache**
+(`~/.cache/huggingface`, or `$HF_HOME`) — never from a directory in this repo
+and never from inside an engine's venv or a library's private cache folder.
+Where a library insists on its own path, the engine fetches from the HF cache
+and points the library at it (symlink or `model_dir`).
+
 ## Engine catalog
 
 | Engine | Model | Notes |

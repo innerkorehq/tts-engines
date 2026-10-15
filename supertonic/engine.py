@@ -20,7 +20,6 @@ wrapper around this module for standalone use.
 import io
 import logging
 from pathlib import Path
-from typing import Optional
 
 
 logging.basicConfig(level=logging.INFO)
@@ -39,12 +38,29 @@ class EngineError(Exception):
         self.status = status
 
 
+def _hf_snapshot(repo_id: str, revision: str | None = None, allow_patterns=None) -> str:
+    """Path of `repo_id` in the central Hugging Face cache (~/.cache/huggingface,
+    or $HF_HOME), downloading it there only if it isn't cached yet — weights
+    must never live in the engine's directory or venv."""
+    from huggingface_hub import snapshot_download
+
+    kwargs = dict(repo_id=repo_id, revision=revision, allow_patterns=allow_patterns)
+    try:
+        return snapshot_download(local_files_only=True, **kwargs)  # no network when cached
+    except Exception:
+        return snapshot_download(**kwargs)
+
+
 def _load_model():
-    # Loads the ONNX session(s) from disk, downloading model files first if
-    # needed.
+    # The ONNX files come from the central HF cache (not supertonic's own
+    # ~/.cache/supertonic3 folder), at the revision this package version pins.
     logger.info("Loading Supertonic TTS 3 (one-time, model download may occur)…")
     from supertonic import TTS
-    tts = TTS(auto_download=True)
+    from supertonic.config import DEFAULT_MODEL, MODEL_CONFIGS
+
+    cfg = MODEL_CONFIGS[DEFAULT_MODEL]
+    model_dir = _hf_snapshot(cfg["repo"], cfg["revision"])
+    tts = TTS(model=DEFAULT_MODEL, model_dir=model_dir, auto_download=False)
     logger.info("Supertonic TTS 3 ready.")
     return tts
 
