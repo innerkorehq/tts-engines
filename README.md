@@ -21,6 +21,13 @@ no ports. Each engine also ships an **optional** thin HTTP wrapper
 
 See each engine's own `README.md` for its exact request schema.
 
+## Shared environments
+
+`f5tts`, `f5tts-hinglish` and `omnivoice` share ONE PyTorch venv (`_envs/torch/`,
+~1.3 GB) instead of three ~1 GB copies; each engine's `.venv` is a symlink to it
+and its `setup.sh` builds it on first use. `indicf5` stays separate (its fork ships
+a different `f5_tts` package), as do the non-torch engines.
+
 ## Model weights
 
 Every engine loads its weights from the **central Hugging Face cache**

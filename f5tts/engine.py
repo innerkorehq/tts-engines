@@ -70,7 +70,25 @@ def _cached_preprocess_ref_audio_text(ref_audio_orig, ref_text, *args, **kwargs)
     return cached
 
 
+def _use_soundfile_for_torchaudio_load() -> None:
+    """torchaudio >= 2.9 routes load() through torchcodec, whose shared libraries
+    need ffmpeg <= 8 and fail to load against newer system ffmpeg builds. Decode
+    with soundfile instead (a dependency already), same (tensor, sample_rate)."""
+    import soundfile as sf
+    import torch
+    import torchaudio
+
+    def load(uri, frame_offset=0, num_frames=-1, normalize=True, channels_first=True, format=None,
+             buffer_size=4096, backend=None):
+        data, sample_rate = sf.read(uri, start=frame_offset, frames=num_frames, dtype="float32", always_2d=True)
+        tensor = torch.from_numpy(data)
+        return (tensor.T.contiguous() if channels_first else tensor), sample_rate
+
+    torchaudio.load = load
+
+
 def _load_models():
+    _use_soundfile_for_torchaudio_load()
     from cached_path import cached_path
     from f5_tts.infer.utils_infer import load_model, load_vocoder
     from f5_tts.model import DiT

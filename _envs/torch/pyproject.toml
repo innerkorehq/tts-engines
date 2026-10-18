@@ -1,0 +1,31 @@
+[project]
+name = "tts-torch-env"
+version = "0.1.0"
+description = "ONE shared PyTorch environment for the f5tts, f5tts-hinglish and omnivoice engines (instead of a separate ~1 GB venv each). indicf5 stays separate: its fork provides a different `f5_tts` package."
+requires-python = ">=3.13"
+dependencies = [
+    "f5-tts>=1.1.0",
+    "omnivoice>=0.1.5",
+    "torch>=2.4",
+    "torchaudio>=2.4",
+    "soundfile>=0.12.1",
+    "cached-path>=1.6",
+    "huggingface-hub>=0.25",
+    "numpy",
+    # without this uv's resolver picks numba==0.53.1 (omnivoice -> librosa -> numba)
+    "numba>=0.59",
+    # pydub (via f5-tts) needs it on 3.13 (stdlib audioop was removed) but doesn't declare it;
+    # it used to arrive transitively through gradio.
+    "audioop-lts ; python_version >= '3.13'",
+]
+
+[project.optional-dependencies]
+http = ["fastapi>=0.115", "uvicorn[standard]>=0.30"]
+
+[tool.uv]
+package = false
+# Web-UI / demo packages pulled in by f5-tts and omnivoice that inference never imports.
+override-dependencies = [
+    "gradio ; python_version < '0'",
+    "gradio-client ; python_version < '0'",
+]

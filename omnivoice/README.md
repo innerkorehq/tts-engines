@@ -14,8 +14,8 @@ heuristic on the generated audio.
 ## Run it
 
 ```bash
-uv venv --python 3.13 && uv sync   # or: bash setup.sh
-uv run --extra http server.py                    # PORT=8008 by default
+bash setup.sh   # builds (once) and links the shared PyTorch env, tts-engines/_envs/torch
+(cd ../_envs/torch && uv sync --extra http) && .venv/bin/python server.py                    # PORT=8008 by default
 ```
 
 Model weights download lazily from `k2-fsa/OmniVoice` on first startup.

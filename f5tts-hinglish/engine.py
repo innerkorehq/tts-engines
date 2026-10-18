@@ -65,7 +65,25 @@ def _repo_looks_cached(repo_id: str) -> bool:
     return snapshots.is_dir() and any(snapshots.iterdir())
 
 
+def _use_soundfile_for_torchaudio_load() -> None:
+    """torchaudio >= 2.9 routes load() through torchcodec, whose shared libraries
+    need ffmpeg <= 8 and fail to load against newer system ffmpeg builds. Decode
+    with soundfile instead (a dependency already), same (tensor, sample_rate)."""
+    import soundfile as sf
+    import torch
+    import torchaudio
+
+    def load(uri, frame_offset=0, num_frames=-1, normalize=True, channels_first=True, format=None,
+             buffer_size=4096, backend=None):
+        data, sample_rate = sf.read(uri, start=frame_offset, frames=num_frames, dtype="float32", always_2d=True)
+        tensor = torch.from_numpy(data)
+        return (tensor.T.contiguous() if channels_first else tensor), sample_rate
+
+    torchaudio.load = load
+
+
 def _load_model():
+    _use_soundfile_for_torchaudio_load()
     # hf_hub_download() hits huggingface.co's API unconditionally (no local
     # cache check of its own) unless HF_HUB_OFFLINE is set — force it once
     # this repo is confirmed cached, so a transient HF Hub connectivity blip
